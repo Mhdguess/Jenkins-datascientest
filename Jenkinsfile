@@ -93,26 +93,52 @@ pipeline {
       }
     }
     
-    stage('Diagnostic Cluster') {
+    stage('Diagnostic et Nettoyage Cluster') {
       steps {
         script {
           sh '''
-          echo "=== Diagnostic du cluster ==="
+          echo "=== Diagnostic et nettoyage du cluster ==="
           mkdir -p .kube
           cp /var/lib/jenkins/.kube/config .kube/config
+          KUBECONFIG=".kube/config"
           
-          echo "1. Vérification des nœuds et de leurs taints:"
-          kubectl get nodes -o wide --kubeconfig=.kube/config
-          echo ""
-          echo "2. Détails des taints:"
-          kubectl describe nodes --kubeconfig=.kube/config | grep -A 5 -B 5 Taints || true
-          echo ""
-          echo "3. Taints exacts:"
-          kubectl get nodes -o jsonpath="{.items[*].spec.taints}" --kubeconfig=.kube/config
+          # 1. Vérifier l'état du nœud
+          echo "1. État du nœud:"
+          kubectl get nodes --kubeconfig=$KUBECONFIG
           echo ""
           
-          echo "4. Vérification des pods existants:"
-          kubectl get pods -A --kubeconfig=.kube/config | grep -v Completed || true
+          # 2. Vérifier les taints
+          echo "2. Taints actuels:"
+          kubectl describe nodes --kubeconfig=$KUBECONFIG | grep -i taint || echo "Aucun taint"
+          echo ""
+          
+          # 3. SOLUTION: Supprimer le taint de disk-pressure
+          echo "3. Suppression du taint 'disk-pressure'..."
+          kubectl taint nodes --all node.kubernetes.io/disk-pressure:NoSchedule- --kubeconfig=$KUBECONFIG
+          
+          # 4. Vérifier l'espace disque
+          echo "4. Vérification de l'espace disque du nœud..."
+          kubectl describe nodes --kubeconfig=$KUBECONFIG | grep -A 5 -B 5 "Allocated resources:" || true
+          echo ""
+          
+          # 5. Nettoyer les anciens pods terminés
+          echo "5. Nettoyage des pods terminés..."
+          for ns in dev staging prod kube-system; do
+            echo "--- Namespace $ns ---"
+            # Supprimer les pods en erreur/terminés
+            kubectl delete pods -n $ns --field-selector=status.phase!=Running --kubeconfig=$KUBECONFIG 2>/dev/null || true
+          done
+          
+          # 6. Supprimer les anciens déploiements
+          echo "6. Suppression des anciens déploiements..."
+          for ns in dev staging prod; do
+            kubectl delete deployment app-fastapi -n $ns --ignore-not-found=true --kubeconfig=$KUBECONFIG 2>/dev/null || true
+            sleep 2
+          done
+          
+          # 7. Vérification finale
+          echo "7. État final des taints:"
+          kubectl describe nodes --kubeconfig=$KUBECONFIG | grep -i taint || echo "✓ Aucun taint restant"
           '''
         }
       }
@@ -123,23 +149,9 @@ pipeline {
         script {
           sh '''
           echo "=== Déploiement en développement ==="
-          
-          # Réutiliser le kubeconfig
           KUBECONFIG=".kube/config"
           
-          # Créer namespace dev
-          kubectl create namespace dev --dry-run=client -o yaml | kubectl apply -f - --kubeconfig=$KUBECONFIG || true
-          
-          # Nettoyer les anciens déploiements
-          echo "Nettoyage des anciens déploiements..."
-          kubectl delete deployment app-fastapi -n dev --ignore-not-found=true --kubeconfig=$KUBECONFIG
-          kubectl delete replicaset -n dev -l app.kubernetes.io/name=fastapi --ignore-not-found=true --kubeconfig=$KUBECONFIG
-          
-          # Attendre que la suppression soit effective
-          echo "Attente de la suppression des anciens pods..."
-          sleep 10
-          
-          # Créer un fichier values complet AVEC NODE SELECTOR
+          # Créer un fichier values SIMPLIFIÉ avec toleration pour disk-pressure
           cat > values-dev.yml << EOF
 replicaCount: 1
 
@@ -148,70 +160,29 @@ image:
   pullPolicy: IfNotPresent
   tag: "${DOCKER_TAG}"
 
-imagePullSecrets: []
-nameOverride: ""
-fullnameOverride: ""
-
-serviceAccount:
-  create: true
-  annotations: {}
-  name: ""
-
-podAnnotations: {}
-podLabels: {}
-
-podSecurityContext: {}
-
-securityContext: {}
-
 service:
   type: NodePort
   port: 80
 
-ingress:
-  enabled: false
-  className: ""
-  annotations: {}
-  hosts:
-    - host: chart-example.local
-      paths:
-        - path: /
-          pathType: ImplementationSpecific
-  tls: []
-
-resources: {}
-
-autoscaling:
-  enabled: false
-  minReplicas: 1
-  maxReplicas: 100
-  targetCPUUtilizationPercentage: 80
-
-# SOLUTION: Forcer l'exécution sur le master avec nodeSelector et tolerations
-nodeSelector:
-  node-role.kubernetes.io/control-plane: ""
-
+# Toleration pour disk-pressure
 tolerations:
-- key: "node-role.kubernetes.io/control-plane"
-  operator: "Exists"
-  effect: "NoSchedule"
-- key: "node-role.kubernetes.io/master"
-  operator: "Exists"
-  effect: "NoSchedule"
-- key: "node.kubernetes.io/not-ready"
-  operator: "Exists"
-  effect: "NoSchedule"
-- key: "node.kubernetes.io/unreachable"
+- key: "node.kubernetes.io/disk-pressure"
   operator: "Exists"
   effect: "NoSchedule"
 
-affinity: {}
+resources:
+  requests:
+    memory: "64Mi"
+    cpu: "50m"
+  limits:
+    memory: "128Mi"
+    cpu: "100m"
 EOF
           
-          echo "Valeurs utilisées pour le déploiement:"
-          cat values-dev.yml | grep -E "(tag:|nodeSelector:|tolerations:)"
+          echo "Valeurs utilisées:"
+          cat values-dev.yml | grep -E "(tag:|tolerations:|memory:|cpu:)"
           
-          # Déployer avec Helm SANS --wait --timeout
+          # Déployer avec Helm
           echo "Exécution de Helm upgrade/install..."
           helm upgrade --install app fastapi \
             --values=values-dev.yml \
@@ -219,48 +190,34 @@ EOF
             --kubeconfig=$KUBECONFIG \
             --create-namespace
           
-          # Attendre manuellement que les pods démarrent
-          echo "Attente du démarrage des pods (vérification toutes les 10 secondes)..."
-          MAX_ATTEMPTS=30  # 30 * 10 = 300 secondes = 5 minutes max
-          for i in $(seq 1 $MAX_ATTEMPTS); do
-            POD_STATUS=$(kubectl get pods -n dev -l app.kubernetes.io/name=fastapi -o jsonpath='{.items[*].status.phase}' --kubeconfig=$KUBECONFIG 2>/dev/null || echo "")
-            
-            if echo "$POD_STATUS" | grep -q "Running"; then
-              echo "✓ Pod(s) en cours d'exécution à la tentative $i"
+          # Attendre et vérifier
+          echo "Attente du démarrage du pod..."
+          for i in $(seq 1 30); do  # 30 * 2 = 60 secondes max
+            POD_STATUS=$(kubectl get pods -n dev -l app.kubernetes.io/name=fastapi -o jsonpath='{.items[0].status.phase}' --kubeconfig=$KUBECONFIG 2>/dev/null || echo "NotFound")
+            if [ "$POD_STATUS" = "Running" ]; then
+              echo "✓ Pod en cours d'exécution après ${i}2 secondes"
               break
-            elif echo "$POD_STATUS" | grep -q "Pending"; then
-              echo "⏳ Pod(s) en attente... tentative $i/$MAX_ATTEMPTS"
-            elif echo "$POD_STATUS" | grep -q "ContainerCreating"; then
-              echo "🔧 Pod(s) en création... tentative $i/$MAX_ATTEMPTS"
+            elif [ "$POD_STATUS" = "Pending" ]; then
+              echo "⏳ Pod en attente... ($i/30)"
+            elif [ "$POD_STATUS" = "ContainerCreating" ]; then
+              echo "🔧 Pod en création... ($i/30)"
             else
-              echo "? Statut: $POD_STATUS - tentative $i/$MAX_ATTEMPTS"
+              echo "? Statut: $POD_STATUS ($i/30)"
             fi
-            
-            if [ $i -eq $MAX_ATTEMPTS ]; then
-              echo "⚠️  Délai d'attente maximal atteint, poursuite du pipeline..."
-              break
-            fi
-            
-            sleep 10
+            sleep 2
           done
           
-          echo "Vérification finale du déploiement..."
+          echo "Vérification finale:"
           kubectl get pods,svc -n dev --kubeconfig=$KUBECONFIG
           
-          echo "Détails des pods:"
-          kubectl describe pods -n dev --selector=app.kubernetes.io/name=fastapi --kubeconfig=$KUBECONFIG 2>/dev/null | head -100 || true
-          
-          # Vérifier les logs seulement si le pod est Running
+          # Afficher les logs si le pod est Running
           POD_NAME=$(kubectl get pods -n dev -l app.kubernetes.io/name=fastapi -o jsonpath='{.items[0].metadata.name}' --kubeconfig=$KUBECONFIG 2>/dev/null || echo "")
           if [ -n "$POD_NAME" ]; then
-            POD_PHASE=$(kubectl get pod $POD_NAME -n dev -o jsonpath='{.status.phase}' --kubeconfig=$KUBECONFIG 2>/dev/null || echo "")
-            if [ "$POD_PHASE" = "Running" ]; then
-              echo "Logs du pod $POD_NAME:"
-              kubectl logs $POD_NAME -n dev --kubeconfig=$KUBECONFIG --tail=20 || true
-            else
-              echo "Pod $POD_NAME en phase: $POD_PHASE"
-              echo "Événements récents:"
-              kubectl get events -n dev --sort-by='.lastTimestamp' --field-selector involvedObject.name=$POD_NAME --kubeconfig=$KUBECONFIG | tail -10 || true
+            echo "Détails du pod:"
+            kubectl describe pod $POD_NAME -n dev --kubeconfig=$KUBECONFIG | tail -20
+            if kubectl get pod $POD_NAME -n dev --kubeconfig=$KUBECONFIG 2>/dev/null | grep -q Running; then
+              echo "Logs du pod:"
+              kubectl logs $POD_NAME -n dev --kubeconfig=$KUBECONFIG --tail=10
             fi
           fi
           '''
@@ -273,18 +230,8 @@ EOF
         script {
           sh '''
           echo "=== Déploiement en staging ==="
-          
-          # Réutiliser le même kubeconfig
           KUBECONFIG=".kube/config"
           
-          # Créer namespace staging
-          kubectl create namespace staging --dry-run=client -o yaml | kubectl apply -f - --kubeconfig=$KUBECONFIG || true
-          
-          # Nettoyer les anciens déploiements
-          kubectl delete deployment app-fastapi -n staging --ignore-not-found=true --kubeconfig=$KUBECONFIG
-          sleep 5
-          
-          # Créer values avec nodeSelector
           cat > values-staging.yml << EOF
 replicaCount: 2
 
@@ -293,64 +240,23 @@ image:
   pullPolicy: Always
   tag: "${DOCKER_TAG}"
 
-imagePullSecrets: []
-nameOverride: ""
-fullnameOverride: ""
-
-serviceAccount:
-  create: true
-  annotations: {}
-  name: ""
-
-podAnnotations: {}
-podLabels: {}
-
-podSecurityContext: {}
-
-securityContext: {}
-
 service:
   type: NodePort
   port: 80
 
-ingress:
-  enabled: false
-  className: ""
-  annotations: {}
-  hosts:
-    - host: chart-example.local
-      paths:
-        - path: /
-          pathType: ImplementationSpecific
-  tls: []
-
-resources: {}
-
-autoscaling:
-  enabled: false
-  minReplicas: 1
-  maxReplicas: 100
-  targetCPUUtilizationPercentage: 80
-
-# SOLUTION: Forcer l'exécution sur le master avec nodeSelector et tolerations
-nodeSelector:
-  node-role.kubernetes.io/control-plane: ""
-
+# Toleration pour disk-pressure
 tolerations:
-- key: "node-role.kubernetes.io/control-plane"
-  operator: "Exists"
-  effect: "NoSchedule"
-- key: "node-role.kubernetes.io/master"
-  operator: "Exists"
-  effect: "NoSchedule"
-- key: "node.kubernetes.io/not-ready"
-  operator: "Exists"
-  effect: "NoSchedule"
-- key: "node.kubernetes.io/unreachable"
+- key: "node.kubernetes.io/disk-pressure"
   operator: "Exists"
   effect: "NoSchedule"
 
-affinity: {}
+resources:
+  requests:
+    memory: "64Mi"
+    cpu: "50m"
+  limits:
+    memory: "128Mi"
+    cpu: "100m"
 EOF
           
           echo "Déploiement avec Helm..."
@@ -360,15 +266,14 @@ EOF
             --kubeconfig=$KUBECONFIG \
             --create-namespace
           
-          # Attente simplifiée
-          echo "Attente du démarrage des pods..."
-          sleep 30
+          sleep 15
           
-          echo "Vérification staging..."
+          echo "Vérification:"
           kubectl get pods -n staging --kubeconfig=$KUBECONFIG
           
-          echo "Statut des pods:"
-          kubectl get pods -n staging -l app.kubernetes.io/name=fastapi -o wide --kubeconfig=$KUBECONFIG || true
+          # Vérifier l'état des pods
+          RUNNING_COUNT=$(kubectl get pods -n staging -l app.kubernetes.io/name=fastapi --field-selector=status.phase=Running --kubeconfig=$KUBECONFIG 2>/dev/null | grep -c Running || echo "0")
+          echo "Pods en cours d'exécution: $RUNNING_COUNT/2"
           '''
         }
       }
@@ -382,66 +287,44 @@ EOF
         script {
           sh '''
           echo "=== Déploiement en production ==="
-          
-          # Réutiliser le même kubeconfig
           KUBECONFIG=".kube/config"
           
-          # Créer namespace prod
-          kubectl create namespace prod --dry-run=client -o yaml | kubectl apply -f - --kubeconfig=$KUBECONFIG || true
-          
-          # Nettoyer les anciens déploiements
-          kubectl delete deployment app-fastapi -n prod --ignore-not-found=true --kubeconfig=$KUBECONFIG
-          sleep 5
-          
-          # Créer un fichier d'overrides complet
           cat > prod-overrides.yml << EOF
 image:
   repository: guessod/datascientestapi
   tag: ${DOCKER_TAG}
   pullPolicy: Always
 replicaCount: 3
-resources:
-  limits:
-    cpu: 500m
-    memory: 512Mi
-  requests:
-    cpu: 200m
-    memory: 256Mi
 
-# SOLUTION: Forcer l'exécution sur le master avec nodeSelector et tolerations
-nodeSelector:
-  node-role.kubernetes.io/control-plane: ""
+service:
+  type: NodePort
+  port: 80
 
+# Toleration pour disk-pressure
 tolerations:
-- key: "node-role.kubernetes.io/control-plane"
+- key: "node.kubernetes.io/disk-pressure"
   operator: "Exists"
   effect: "NoSchedule"
-- key: "node-role.kubernetes.io/master"
-  operator: "Exists"
-  effect: "NoSchedule"
-- key: "node.kubernetes.io/not-ready"
-  operator: "Exists"
-  effect: "NoSchedule"
-- key: "node.kubernetes.io/unreachable"
-  operator: "Exists"
-  effect: "NoSchedule"
+
+resources:
+  requests:
+    memory: "64Mi"
+    cpu: "50m"
+  limits:
+    memory: "128Mi"
+    cpu: "100m"
 EOF
           
-          # Déployer avec Helm - utiliser seulement le fichier d'overrides
           helm upgrade --install app fastapi \
             --namespace prod \
             --kubeconfig=$KUBECONFIG \
             --create-namespace \
             --values=prod-overrides.yml
           
-          echo "Attente du démarrage des pods..."
-          sleep 30
+          sleep 20
           
-          echo "Vérification production..."
-          kubectl get pods,svc -n prod --kubeconfig=$KUBECONFIG
-          
-          echo "État des pods:"
-          kubectl get pods -n prod -l app.kubernetes.io/name=fastapi -o wide --kubeconfig=$KUBECONFIG || true
+          echo "Vérification:"
+          kubectl get pods -n prod --kubeconfig=$KUBECONFIG
           
           echo "✓ Déploiement en production lancé!"
           '''
@@ -455,22 +338,26 @@ EOF
       script {
         sh '''
         echo "=== Rapport final ==="
-        echo "Fichiers générés:"
-        ls -la *.yml 2>/dev/null || true
+        KUBECONFIG=".kube/config"
         
-        echo "État final des déploiements:"
+        echo "1. État des déploiements:"
         for ns in dev staging prod; do
-          echo "--- Namespace $ns ---"
-          kubectl get pods -n $ns --kubeconfig=.kube/config 2>/dev/null || echo "Namespace $ns non accessible"
-          RUNNING_PODS=$(kubectl get pods -n $ns -l app.kubernetes.io/name=fastapi --field-selector=status.phase=Running --kubeconfig=.kube/config 2>/dev/null | grep -c Running || echo "0")
-          if [ "$RUNNING_PODS" -gt "0" ]; then
-            echo "✓ $RUNNING_PODS pod(s) en cours d'exécution dans $ns"
-          else
-            echo "✗ Aucun pod n'est en cours d'exécution dans $ns"
-            echo "Derniers événements:"
-            kubectl get events -n $ns --sort-by='.lastTimestamp' --kubeconfig=.kube/config | tail -3 2>/dev/null || true
-          fi
+          echo "--- $ns ---"
+          kubectl get pods -n $ns --kubeconfig=$KUBECONFIG 2>/dev/null || echo "Namespace inaccessible"
+          TOTAL_PODS=$(kubectl get pods -n $ns -l app.kubernetes.io/name=fastapi --kubeconfig=$KUBECONFIG 2>/dev/null | grep -c -v NAME || echo "0")
+          RUNNING_PODS=$(kubectl get pods -n $ns -l app.kubernetes.io/name=fastapi --field-selector=status.phase=Running --kubeconfig=$KUBECONFIG 2>/dev/null | grep -c Running || echo "0")
+          echo "Pods: $RUNNING_PODS/$TOTAL_PODS en cours d'exécution"
+          echo ""
         done
+        
+        echo "2. Services exposés:"
+        for ns in dev staging prod; do
+          NODE_PORT=$(kubectl get svc -n $ns app-fastapi -o jsonpath='{.spec.ports[0].nodePort}' --kubeconfig=$KUBECONFIG 2>/dev/null || echo "N/A")
+          echo "$ns: NodePort = $NODE_PORT"
+        done
+        
+        echo "3. État du nœud:"
+        kubectl describe nodes --kubeconfig=$KUBECONFIG | grep -E "(Taints:|Allocated resources:)" || true
         '''
       }
     }
@@ -478,10 +365,15 @@ EOF
       script {
         sh '''
         echo "✓ Pipeline exécuté avec succès!"
-        echo "Résumé:"
-        echo "1. Image Docker construite et push: guessod/datascientestapi:${DOCKER_TAG}"
-        echo "2. Déploiements Kubernetes mis à jour dans dev, staging, prod"
-        echo "3. Vérifiez l'état des pods avec: kubectl get pods -A"
+        echo ""
+        echo "RÉSUMÉ:"
+        echo "1. Image Docker: guessod/datascientestapi:${DOCKER_TAG}"
+        echo "2. Taint 'disk-pressure' supprimé du nœud"
+        echo "3. Déploiements mis à jour avec tolerations pour disk-pressure"
+        echo "4. Accès aux applications:"
+        echo "   - dev: curl http://<node-ip>:<node-port-dev>"
+        echo "   - staging: curl http://<node-ip>:<node-port-staging>"
+        echo "   - prod: curl http://<node-ip>:<node-port-prod>"
         '''
       }
     }
@@ -489,12 +381,17 @@ EOF
       script {
         sh '''
         echo "✗ Pipeline en échec"
-        echo "Informations de débogage:"
-        echo "1. Nœuds disponibles:"
-        kubectl get nodes --kubeconfig=.kube/config 2>/dev/null || true
         echo ""
-        echo "2. Services dans dev:"
-        kubectl get svc -n dev --kubeconfig=.kube/config 2>/dev/null || true
+        echo "DÉBOGAGE:"
+        KUBECONFIG=".kube/config"
+        echo "1. Événements récents:"
+        kubectl get events -A --sort-by='.lastTimestamp' --kubeconfig=$KUBECONFIG | tail -10 2>/dev/null || true
+        echo ""
+        echo "2. État des pods:"
+        kubectl get pods -A --kubeconfig=$KUBECONFIG | grep -v Completed 2>/dev/null || true
+        echo ""
+        echo "3. Espace disque:"
+        df -h /var/lib/docker /var/lib/kubelet 2>/dev/null || true
         '''
       }
     }
