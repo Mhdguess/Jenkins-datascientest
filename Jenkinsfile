@@ -100,30 +100,43 @@ pipeline {
           cp /var/lib/jenkins/.kube/config .kube/config
           KUBECONFIG=".kube/config"
           
-          # 1. Supprimer le taint disk-pressure (même s'il revient, on le supprime)
+          # 1. Supprimer le taint disk-pressure
           echo "1. Suppression du taint disk-pressure..."
           kubectl taint nodes --all node.kubernetes.io/disk-pressure:NoSchedule- --kubeconfig=$KUBECONFIG 2>/dev/null || true
           
-          # 2. Configurer le nœud pour ignorer la pression disque temporairement
-          echo "2. Configuration de la tolérance à la pression disque..."
+          # 2. NETTOYAGE COMPLET - Supprimer tous les déploiements et services existants
+          echo "2. Nettoyage complet des ressources existantes..."
+          for ns in dev staging prod; do
+            echo "--- Nettoyage namespace $ns ---"
+            # Supprimer les déploiements
+            kubectl delete deployment fastapi-dev -n $ns --ignore-not-found=true --kubeconfig=$KUBECONFIG
+            kubectl delete deployment fastapi-staging -n $ns --ignore-not-found=true --kubeconfig=$KUBECONFIG
+            kubectl delete deployment fastapi-prod -n $ns --ignore-not-found=true --kubeconfig=$KUBECONFIG
+            kubectl delete deployment app-fastapi -n $ns --ignore-not-found=true --kubeconfig=$KUBECONFIG
+            
+            # Supprimer les services
+            kubectl delete svc fastapi-dev -n $ns --ignore-not-found=true --kubeconfig=$KUBECONFIG
+            kubectl delete svc fastapi-staging -n $ns --ignore-not-found=true --kubeconfig=$KUBECONFIG
+            kubectl delete svc fastapi-prod -n $ns --ignore-not-found=true --kubeconfig=$KUBECONFIG
+            kubectl delete svc app-fastapi -n $ns --ignore-not-found=true --kubeconfig=$KUBECONFIG
+            
+            # Supprimer tous les pods restants
+            kubectl delete pods --all -n $ns --kubeconfig=$KUBECONFIG --ignore-not-found=true
+          done
           
-          # 3. Créer un déploiement avec des ressources minimales et des tolerations
+          # Attendre que tout soit supprimé
+          sleep 5
+          
+          # 3. Créer les namespaces s'ils n'existent pas
+          echo "3. Création des namespaces..."
+          for ns in dev staging prod; do
+            kubectl create namespace $ns --dry-run=client -o yaml --kubeconfig=$KUBECONFIG | kubectl apply -f - --kubeconfig=$KUBECONFIG
+          done
+          
+          # 4. Créer les déploiements AVEC des ports NodePort AUTO (pas fixés)
+          echo "4. Création des déploiements avec ports automatiques..."
+          
           cat > all-deployments.yaml << EOF
----
-apiVersion: v1
-kind: Namespace
-metadata:
-  name: dev
----
-apiVersion: v1
-kind: Namespace
-metadata:
-  name: staging
----
-apiVersion: v1
-kind: Namespace
-metadata:
-  name: prod
 ---
 apiVersion: apps/v1
 kind: Deployment
@@ -142,7 +155,6 @@ spec:
         app: fastapi
         env: dev
     spec:
-      # Tolerations pour accepter les pods même avec disk-pressure
       tolerations:
       - key: "node.kubernetes.io/disk-pressure"
         operator: "Exists"
@@ -158,8 +170,8 @@ spec:
         - containerPort: 80
         resources:
           requests:
-            memory: "32Mi"  # TRÈS FAIBLE
-            cpu: "10m"      # TRÈS FAIBLE
+            memory: "32Mi"
+            cpu: "10m"
           limits:
             memory: "64Mi"
             cpu: "50m"
@@ -177,7 +189,7 @@ spec:
   ports:
   - port: 80
     targetPort: 80
-    nodePort: 31079
+    # NE PAS spécifier nodePort, laisser Kubernetes choisir
 ---
 apiVersion: apps/v1
 kind: Deployment
@@ -185,7 +197,7 @@ metadata:
   name: fastapi-staging
   namespace: staging
 spec:
-  replicas: 1  # Réduit à 1 pour économiser des ressources
+  replicas: 1
   selector:
     matchLabels:
       app: fastapi
@@ -230,7 +242,6 @@ spec:
   ports:
   - port: 80
     targetPort: 80
-    nodePort: 30393
 ---
 apiVersion: apps/v1
 kind: Deployment
@@ -238,7 +249,7 @@ metadata:
   name: fastapi-prod
   namespace: prod
 spec:
-  replicas: 1  # Réduit à 1 pour économiser des ressources
+  replicas: 1
   selector:
     matchLabels:
       app: fastapi
@@ -283,33 +294,53 @@ spec:
   ports:
   - port: 80
     targetPort: 80
-    nodePort: 31570
 EOF
           
-          echo "3. Application des déploiements..."
+          echo "5. Application des déploiements..."
           kubectl apply -f all-deployments.yaml --kubeconfig=$KUBECONFIG
           
-          # 4. Vérification progressive
-          echo "4. Vérification des déploiements..."
+          # 6. Vérification
+          echo "6. Vérification des déploiements..."
           for ns in dev staging prod; do
             echo "--- Namespace: $ns ---"
             kubectl get deployments,svc -n $ns --kubeconfig=$KUBECONFIG
           done
           
-          # 5. Attendre et vérifier les pods
-          echo "5. Attente du démarrage des pods..."
+          # 7. Attendre et vérifier les pods
+          echo "7. Attente du démarrage des pods..."
           for attempt in {1..30}; do
+            echo "Tentative $attempt/30..."
+            
+            # Vérifier l'état de chaque namespace
             ALL_RUNNING=true
             for ns in dev staging prod; do
-              POD_STATUS=$(kubectl get pods -n $ns -l app=fastapi -o jsonpath='{.items[0].status.phase}' --kubeconfig=$KUBECONFIG 2>/dev/null || echo "NotFound")
-              if [ "$POD_STATUS" != "Running" ]; then
+              # Récupérer le nom du pod
+              POD_NAME=$(kubectl get pods -n $ns -l app=fastapi -o jsonpath='{.items[0].metadata.name}' --kubeconfig=$KUBECONFIG 2>/dev/null || echo "")
+              
+              if [ -n "$POD_NAME" ]; then
+                POD_STATUS=$(kubectl get pod $POD_NAME -n $ns -o jsonpath='{.status.phase}' --kubeconfig=$KUBECONFIG 2>/dev/null || echo "NotFound")
+                
+                if [ "$POD_STATUS" = "Running" ]; then
+                  echo "  ✓ $ns: Pod $POD_NAME en cours d'exécution"
+                elif [ "$POD_STATUS" = "Pending" ] || [ "$POD_STATUS" = "ContainerCreating" ]; then
+                  echo "  ⏳ $ns: Pod en attente ($POD_STATUS)"
+                  ALL_RUNNING=false
+                else
+                  echo "  ⚠ $ns: Statut $POD_STATUS"
+                  # Afficher les détails si en échec
+                  if [ "$POD_STATUS" = "Failed" ] || [ "$POD_STATUS" = "Evicted" ]; then
+                    kubectl describe pod $POD_NAME -n $ns --kubeconfig=$KUBECONFIG | tail -20
+                  fi
+                  ALL_RUNNING=false
+                fi
+              else
+                echo "  ❌ $ns: Aucun pod trouvé"
                 ALL_RUNNING=false
-                echo "$ns: $POD_STATUS"
               fi
             done
             
             if [ "$ALL_RUNNING" = true ]; then
-              echo "✓ Tous les pods sont en cours d'exécution après ${attempt} tentatives"
+              echo "✓✓✓ Tous les pods sont en cours d'exécution ✓✓✓"
               break
             fi
             
@@ -320,12 +351,25 @@ EOF
             sleep 2
           done
           
-          # 6. Affichage final
-          echo "6. État final:"
+          # 8. Affichage final détaillé
+          echo "8. État final détaillé:"
           for ns in dev staging prod; do
-            echo "--- $ns ---"
-            kubectl get pods,svc -n $ns --kubeconfig=$KUBECONFIG
             echo ""
+            echo "=== $ns ==="
+            echo "Déploiements:"
+            kubectl get deployments -n $ns --kubeconfig=$KUBECONFIG
+            echo ""
+            echo "Services:"
+            kubectl get svc -n $ns --kubeconfig=$KUBECONFIG
+            echo ""
+            echo "Pods:"
+            kubectl get pods -n $ns --kubeconfig=$KUBECONFIG -o wide
+            echo ""
+            
+            # Afficher les NodePorts attribués
+            NODE_PORT=$(kubectl get svc -n $ns -l app=fastapi -o jsonpath='{.items[0].spec.ports[0].nodePort}' --kubeconfig=$KUBECONFIG 2>/dev/null || echo "N/A")
+            CLUSTER_IP=$(kubectl get svc -n $ns -l app=fastapi -o jsonpath='{.items[0].spec.clusterIP}' --kubeconfig=$KUBECONFIG 2>/dev/null || echo "N/A")
+            echo "Accès: http://<NODE_IP>:$NODE_PORT (ClusterIP: $CLUSTER_IP)"
           done
           '''
         }
@@ -337,57 +381,94 @@ EOF
     always {
       script {
         sh '''
-        echo "=== RAPPORT FINAL ==="
+        echo "=== RAPPORT FINAL DU PIPELINE ==="
         KUBECONFIG=".kube/config"
         
         echo "1. État du nœud:"
-        kubectl get nodes -o wide --kubeconfig=$KUBECONFIG
+        kubectl get nodes -o wide --kubeconfig=$KUBECONFIG 2>/dev/null || echo "Impossible de récupérer l'état des nœuds"
         echo ""
         
         echo "2. Taints actuels:"
-        kubectl describe nodes --kubeconfig=$KUBECONFIG | grep -i taint || echo "Information non disponible"
+        kubectl describe nodes --kubeconfig=$KUBECONFIG 2>/dev/null | grep -i taint || echo "Information non disponible"
         echo ""
         
         echo "3. Résumé des déploiements:"
+        echo "Namespace | Déploiement | Pods (Running/Total) | NodePort"
+        echo "----------|-------------|---------------------|----------"
         for ns in dev staging prod; do
           RUNNING=$(kubectl get pods -n $ns -l app=fastapi --field-selector=status.phase=Running --no-headers --kubeconfig=$KUBECONFIG 2>/dev/null | wc -l || echo "0")
           TOTAL=$(kubectl get pods -n $ns -l app=fastapi --no-headers --kubeconfig=$KUBECONFIG 2>/dev/null | wc -l || echo "0")
           NODE_PORT=$(kubectl get svc -n $ns -l app=fastapi -o jsonpath='{.items[0].spec.ports[0].nodePort}' --kubeconfig=$KUBECONFIG 2>/dev/null || echo "N/A")
-          echo "$ns: $RUNNING/$TOTAL pods - NodePort: $NODE_PORT"
+          echo "$ns       | fastapi     | $RUNNING/$TOTAL           | $NODE_PORT"
         done
+        echo ""
+        
+        echo "4. Espace disque restant:"
+        df -h / | tail -1
+        echo ""
+        
+        echo "5. Image Docker utilisée:"
+        echo "   guessod/datascientestapi:${DOCKER_TAG}"
         '''
       }
     }
     success {
       script {
         sh '''
-        echo "✅ PIPELINE TERMINÉ AVEC SUCCÈS"
         echo ""
-        echo "Les applications sont déployées avec succès malgré la pression disque."
-        echo "Pour améliorer la situation à long terme:"
-        echo "1. Libérez au moins 10GB d'espace disque"
-        echo "2. Surveillez l'espace: df -h"
-        echo "3. Configurez des limites de stockage dans Kubernetes"
+        echo "✅✅✅ PIPELINE TERMINÉ AVEC SUCCÈS ✅✅✅"
+        echo ""
+        echo "RÉCAPITULATIF:"
+        echo "1. Image Docker construite et publiée avec succès"
+        echo "2. Applications déployées sur Kubernetes (dev, staging, prod)"
+        echo "3. Configuration adaptée pour gérer la pression disque"
+        echo ""
+        echo "NEXT STEPS:"
+        echo "1. Récupérer l'adresse IP de votre nœud:"
+        echo "   kubectl get nodes -o wide"
+        echo ""
+        echo "2. Tester l'accès aux applications:"
+        echo "   curl http://<NODE_IP>:<NODE_PORT_DEV>"
+        echo "   curl http://<NODE_IP>:<NODE_PORT_STAGING>"
+        echo "   curl http://<NODE_IP>:<NODE_PORT_PROD>"
+        echo ""
+        echo "3. Pour libérer durablement de l'espace disque:"
+        echo "   - Nettoyer régulièrement: docker system prune -a -f"
+        echo "   - Étendre la partition si possible"
+        echo "   - Configurer des limites de stockage"
         '''
       }
     }
     failure {
       script {
         sh '''
-        echo "❌ PIPELINE EN ÉCHEC"
         echo ""
-        echo "Débogage:"
+        echo "❌❌❌ PIPELINE EN ÉCHEC ❌❌❌"
+        echo ""
+        echo "DÉBOGAGE RAPIDE:"
         KUBECONFIG=".kube/config"
-        echo "1. Événements Kubernetes:"
-        kubectl get events -A --sort-by='.lastTimestamp' --kubeconfig=$KUBECONFIG | tail -10
+        
+        echo "1. Vérifier l'état des pods:"
+        kubectl get pods -A --kubeconfig=$KUBECONFIG 2>/dev/null || true
         echo ""
-        echo "2. Espace disque restant:"
-        df -h /
+        
+        echo "2. Vérifier les événements récents:"
+        kubectl get events -A --sort-by='.lastTimestamp' --kubeconfig=$KUBECONFIG 2>/dev/null | tail -5 || true
         echo ""
-        echo "Solution d'urgence:"
-        echo "1. Supprimer des données inutiles"
-        echo "2. Étendre la partition si possible"
-        echo "3. Utiliser un disque externe pour le stockage Docker"
+        
+        echo "3. Vérifier l'espace disque:"
+        df -h / | grep -v Filesystem
+        echo ""
+        
+        echo "SOLUTIONS:"
+        echo "1. Si espace disque insuffisant (<2GB libre):"
+        echo "   docker system prune -a -f"
+        echo "   sudo journalctl --vacuum-time=1d"
+        echo ""
+        echo "2. Si conflit de ports:"
+        echo "   kubectl delete svc --all -n dev staging prod"
+        echo ""
+        echo "3. Relancer le pipeline après nettoyage"
         '''
       }
     }
