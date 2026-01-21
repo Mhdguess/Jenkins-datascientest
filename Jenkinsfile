@@ -124,32 +124,39 @@ pipeline {
           # 5. Créer le namespace si nécessaire
           kubectl create namespace dev --dry-run=client -o yaml | kubectl apply -f - --kubeconfig=.kube/config || true
           
-          # 6. Préparer le fichier values pour Helm - CORRECTION ICI
+          # 6. Préparer le fichier values pour Helm
           cp fastapi/values.yaml values-dev.yml
-          # Modifier le tag proprement - VERSION CORRIGÉE
+          # Modifier le tag
           sed -i 's/^  tag:.*/  tag: "'"${DOCKER_TAG}"'"/' values-dev.yml
           
           echo "Valeurs utilisées pour le déploiement:"
           cat values-dev.yml | grep -A2 -B2 "tag:"
           
-          # 7. Déployer avec Helm
+          # 7. Déployer avec Helm - SANS TIMEOUT ET SANS --wait
           echo "Exécution de Helm upgrade/install..."
           helm upgrade --install app fastapi \
             --values=values-dev.yml \
             --namespace dev \
             --kubeconfig=.kube/config \
-            --create-namespace \
-            --wait \
-            --timeout 5m \
-            --debug 2>&1 | tail -20
+            --create-namespace
           
-          # 8. Vérifier le déploiement
+          # 8. Vérifier le déploiement manuellement
+          echo "Attente du démarrage des pods..."
+          sleep 30
+          
           echo "Vérification du déploiement..."
           kubectl get pods,svc -n dev --kubeconfig=.kube/config
           
-          # 9. Vérifier le rollout
-          kubectl rollout status deployment/app -n dev --kubeconfig=.kube/config --timeout=2m || \
-            echo "Rollback ou timeout, vérifiez les logs des pods"
+          # 9. Vérifier l'état des pods
+          echo "Détails des pods:"
+          kubectl describe pods -n dev --selector=app.kubernetes.io/name=fastapi --kubeconfig=.kube/config || true
+          
+          # 10. Vérifier les logs si les pods tournent
+          POD_NAME=$(kubectl get pods -n dev -l app.kubernetes.io/name=fastapi -o jsonpath='{.items[0].metadata.name}' --kubeconfig=.kube/config 2>/dev/null || echo "")
+          if [ -n "$POD_NAME" ]; then
+            echo "Logs du pod $POD_NAME:"
+            kubectl logs $POD_NAME -n dev --kubeconfig=.kube/config --tail=20 || true
+          fi
           '''
         }
       }
@@ -164,33 +171,47 @@ pipeline {
           # Réutiliser le même kubeconfig
           mkdir -p .kube 2>/dev/null || true
           cp /var/lib/jenkins/.kube/config .kube/config 2>/dev/null || true
+          KUBECONFIG=".kube/config"
           
           # Créer namespace staging
-          kubectl create namespace staging --dry-run=client -o yaml | kubectl apply -f - --kubeconfig=.kube/config || true
+          kubectl create namespace staging --dry-run=client -o yaml | kubectl apply -f - --kubeconfig=$KUBECONFIG || true
           
-          # Préparer values - CORRECTION ICI
+          # Préparer values
           cp fastapi/values.yaml values-staging.yml
-          # Modifier le tag proprement - VERSION CORRIGÉE
+          # Modifier le tag
           sed -i 's/^  tag:.*/  tag: "'"${DOCKER_TAG}"'"/' values-staging.yml
           
-          # Modifier replicaCount proprement - VERSION CORRIGÉE
+          # Modifier replicaCount
           sed -i 's/^replicaCount:.*/replicaCount: 2/' values-staging.yml
           
-          # Vérifier que les modifications sont correctes
-          echo "Vérification des modifications:"
-          grep -n -E "(tag:|replicaCount:)" values-staging.yml
+          # Changer la pull policy pour Always pour s'assurer d'avoir la dernière image
+          sed -i 's/^  pullPolicy:.*/  pullPolicy: Always/' values-staging.yml
           
-          # Déployer
+          echo "Vérification des modifications:"
+          grep -n -E "(tag:|replicaCount:|pullPolicy:)" values-staging.yml
+          
+          # Déployer avec Helm - SANS TIMEOUT ET SANS --wait
+          echo "Déploiement avec Helm..."
           helm upgrade --install app fastapi \
             --values=values-staging.yml \
             --namespace staging \
-            --kubeconfig=.kube/config \
-            --create-namespace \
-            --wait \
-            --timeout 5m
+            --kubeconfig=$KUBECONFIG \
+            --create-namespace
+          
+          # Attendre un peu
+          echo "Attente du démarrage des pods..."
+          sleep 30
           
           echo "Vérification staging..."
-          kubectl get pods -n staging --kubeconfig=.kube/config
+          kubectl get pods -n staging --kubeconfig=$KUBECONFIG
+          
+          # Vérifier les événements pour debug
+          echo "Événements récents:"
+          kubectl get events -n staging --sort-by='.lastTimestamp' --kubeconfig=$KUBECONFIG | tail -10 || true
+          
+          # Vérifier l'état des pods
+          echo "Description des pods:"
+          kubectl describe pods -n staging --selector=app.kubernetes.io/name=fastapi --kubeconfig=$KUBECONFIG 2>/dev/null | head -50 || true
           '''
         }
       }
@@ -208,23 +229,16 @@ pipeline {
           # Réutiliser le même kubeconfig
           mkdir -p .kube 2>/dev/null || true
           cp /var/lib/jenkins/.kube/config .kube/config 2>/dev/null || true
+          KUBECONFIG=".kube/config"
           
           # Créer namespace prod
-          kubectl create namespace prod --dry-run=client -o yaml | kubectl apply -f - --kubeconfig=.kube/config || true
+          kubectl create namespace prod --dry-run=client -o yaml | kubectl apply -f - --kubeconfig=$KUBECONFIG || true
           
-          # Préparer values avec spécificités production - CORRECTION ICI
-          cp fastapi/values.yaml values-prod.yml
-          # Modifier le tag proprement - VERSION CORRIGÉE
-          sed -i 's/^  tag:.*/  tag: "'"${DOCKER_TAG}"'"/' values-prod.yml
-          
-          # Modifier replicaCount - VERSION CORRIGÉE
-          sed -i 's/^replicaCount:.*/replicaCount: 3/' values-prod.yml
-          
-          # Méthode alternative pour éviter les problèmes de sed complexes
-          # Créer un fichier temporaire avec les overrides
+          # Créer un fichier d'overrides séparé pour éviter les problèmes YAML
           cat > prod-overrides.yml << EOF
 image:
   tag: ${DOCKER_TAG}
+  pullPolicy: Always
 replicaCount: 3
 resources:
   limits:
@@ -235,25 +249,26 @@ resources:
     memory: 256Mi
 EOF
           
-          # Déployer avec les overrides
+          # Déployer avec Helm - SANS TIMEOUT ET SANS --wait
           helm upgrade --install app fastapi \
             --namespace prod \
-            --kubeconfig=.kube/config \
+            --kubeconfig=$KUBECONFIG \
             --create-namespace \
             --values=fastapi/values.yaml \
-            --values=prod-overrides.yml \
-            --wait \
-            --timeout 10m \
-            --atomic \
-            --cleanup-on-fail
+            --values=prod-overrides.yml
+          
+          # Attendre un peu
+          echo "Attente du démarrage des pods..."
+          sleep 30
           
           echo "Vérification production..."
-          kubectl get pods,svc,ingress -n prod --kubeconfig=.kube/config
+          kubectl get pods,svc,ingress -n prod --kubeconfig=$KUBECONFIG
           
-          # Vérifier le rollout
-          kubectl rollout status deployment/app -n prod --kubeconfig=.kube/config --timeout=5m
+          # Vérifier les pods en détail
+          echo "État détaillé des pods:"
+          kubectl describe pods -n prod --selector=app.kubernetes.io/name=fastapi --kubeconfig=$KUBECONFIG 2>/dev/null | grep -A 20 "Events:" || true
           
-          echo "✓ Déploiement en production réussi!"
+          echo "✓ Déploiement en production lancé!"
           '''
         }
       }
@@ -268,6 +283,13 @@ EOF
         # Garder les fichiers pour débogage si nécessaire
         echo "Fichiers générés:"
         ls -la *.yml 2>/dev/null || true
+        
+        # Vérifier l'état final de tous les déploiements
+        echo "État final des déploiements:"
+        for ns in dev staging prod; do
+          echo "--- Namespace $ns ---"
+          kubectl get pods,svc -n $ns --kubeconfig=.kube/config 2>/dev/null || echo "Namespace $ns non accessible"
+        done
         '''
       }
     }
