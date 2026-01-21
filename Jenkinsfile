@@ -129,6 +129,20 @@ pipeline {
           # Modifier le tag
           sed -i 's/^  tag:.*/  tag: "'"${DOCKER_TAG}"'"/' values-dev.yml
           
+          # AJOUT: Ajouter des tolerations pour résoudre le problème de scheduling
+          echo "" >> values-dev.yml
+          echo "# AJOUT: Tolerations pour résoudre le problème de taints" >> values-dev.yml
+          echo "tolerations:" >> values-dev.yml
+          echo "- key: \"node.kubernetes.io/not-ready\"" >> values-dev.yml
+          echo "  operator: \"Exists\"" >> values-dev.yml
+          echo "  effect: \"NoSchedule\"" >> values-dev.yml
+          echo "- key: \"node.kubernetes.io/unreachable\"" >> values-dev.yml
+          echo "  operator: \"Exists\"" >> values-dev.yml
+          echo "  effect: \"NoSchedule\"" >> values-dev.yml
+          echo "- key: \"node-role.kubernetes.io/control-plane\"" >> values-dev.yml
+          echo "  operator: \"Exists\"" >> values-dev.yml
+          echo "  effect: \"NoSchedule\"" >> values-dev.yml
+          
           echo "Valeurs utilisées pour le déploiement:"
           cat values-dev.yml | grep -A2 -B2 "tag:"
           
@@ -187,8 +201,22 @@ pipeline {
           # Changer la pull policy pour Always pour s'assurer d'avoir la dernière image
           sed -i 's/^  pullPolicy:.*/  pullPolicy: Always/' values-staging.yml
           
+          # AJOUT: Ajouter des tolerations pour résoudre le problème de scheduling
+          echo "" >> values-staging.yml
+          echo "# AJOUT: Tolerations pour résoudre le problème de taints" >> values-staging.yml
+          echo "tolerations:" >> values-staging.yml
+          echo "- key: \"node.kubernetes.io/not-ready\"" >> values-staging.yml
+          echo "  operator: \"Exists\"" >> values-staging.yml
+          echo "  effect: \"NoSchedule\"" >> values-staging.yml
+          echo "- key: \"node.kubernetes.io/unreachable\"" >> values-staging.yml
+          echo "  operator: \"Exists\"" >> values-staging.yml
+          echo "  effect: \"NoSchedule\"" >> values-staging.yml
+          echo "- key: \"node-role.kubernetes.io/control-plane\"" >> values-staging.yml
+          echo "  operator: \"Exists\"" >> values-staging.yml
+          echo "  effect: \"NoSchedule\"" >> values-staging.yml
+          
           echo "Vérification des modifications:"
-          grep -n -E "(tag:|replicaCount:|pullPolicy:)" values-staging.yml
+          grep -n -E "(tag:|replicaCount:|pullPolicy:|tolerations:)" values-staging.yml
           
           # Déployer avec Helm - SANS TIMEOUT ET SANS --wait
           echo "Déploiement avec Helm..."
@@ -247,6 +275,20 @@ resources:
   requests:
     cpu: 200m
     memory: 256Mi
+# AJOUT: Tolerations pour résoudre le problème de taints
+tolerations:
+- key: "node.kubernetes.io/not-ready"
+  operator: "Exists"
+  effect: "NoSchedule"
+- key: "node.kubernetes.io/unreachable"
+  operator: "Exists"
+  effect: "NoSchedule"
+- key: "node-role.kubernetes.io/control-plane"
+  operator: "Exists"
+  effect: "NoSchedule"
+- key: "node-role.kubernetes.io/master"
+  operator: "Exists"
+  effect: "NoSchedule"
 EOF
           
           # Déployer avec Helm - SANS TIMEOUT ET SANS --wait
