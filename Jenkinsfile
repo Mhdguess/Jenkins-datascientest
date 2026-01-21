@@ -99,9 +99,9 @@ pipeline {
           sh '''
           echo "=== Déploiement en développement ==="
           
-          # 1. Utiliser votre kubeconfig local directement
+          # 1. Utiliser le kubeconfig de Jenkins
           mkdir -p .kube
-          cp ~/.kube/config .kube/config
+          cp /var/lib/jenkins/.kube/config .kube/config
           
           # 2. Vérifier que la connexion fonctionne
           echo "Test de connexion au cluster..."
@@ -124,9 +124,10 @@ pipeline {
           # 5. Créer le namespace si nécessaire
           kubectl create namespace dev --dry-run=client -o yaml | kubectl apply -f - --kubeconfig=.kube/config || true
           
-          # 6. Préparer le fichier values pour Helm
+          # 6. Préparer le fichier values pour Helm - CORRECTION ICI
           cp fastapi/values.yaml values-dev.yml
-          sed -i "s/tag:.*/tag: ${DOCKER_TAG}/" values-dev.yml
+          # Modifier le tag proprement avec des guillemets
+          sed -i '/^  tag:/c\  tag: "'"${DOCKER_TAG}"'"' values-dev.yml
           
           echo "Valeurs utilisées pour le déploiement:"
           cat values-dev.yml | grep -A2 -B2 "tag:"
@@ -162,18 +163,23 @@ pipeline {
           
           # Réutiliser le même kubeconfig
           mkdir -p .kube 2>/dev/null || true
-          cp ~/.kube/config .kube/config 2>/dev/null || true
+          cp /var/lib/jenkins/.kube/config .kube/config 2>/dev/null || true
           
           # Créer namespace staging
           kubectl create namespace staging --dry-run=client -o yaml | kubectl apply -f - --kubeconfig=.kube/config || true
           
-          # Préparer values
+          # Préparer values - CORRECTION ICI
           cp fastapi/values.yaml values-staging.yml
-          sed -i "s/tag:.*/tag: ${DOCKER_TAG}/" values-staging.yml
+          # Modifier le tag proprement avec des guillemets
+          sed -i '/^  tag:/c\  tag: "'"${DOCKER_TAG}"'"' values-staging.yml
           
-          # Ajouter des spécificités staging
-          echo -e "\\n# Configuration staging" >> values-staging.yml
-          echo "replicaCount: 2" >> values-staging.yml
+          # Modifier replicaCount proprement
+          sed -i '/^replicaCount:/c\replicaCount: 2' values-staging.yml
+          
+          # NE PAS utiliser echo pour ajouter du contenu (cela cause l'erreur YAML)
+          # À la place, vérifier que les modifications sont correctes
+          echo "Vérification des modifications:"
+          grep -n -E "(tag:|replicaCount:)" values-staging.yml
           
           # Déployer
           helm upgrade --install app fastapi \
@@ -202,25 +208,54 @@ pipeline {
           
           # Réutiliser le même kubeconfig
           mkdir -p .kube 2>/dev/null || true
-          cp ~/.kube/config .kube/config 2>/dev/null || true
+          cp /var/lib/jenkins/.kube/config .kube/config 2>/dev/null || true
           
           # Créer namespace prod
           kubectl create namespace prod --dry-run=client -o yaml | kubectl apply -f - --kubeconfig=.kube/config || true
           
-          # Préparer values avec spécificités production
+          # Préparer values avec spécificités production - CORRECTION ICI
           cp fastapi/values.yaml values-prod.yml
-          sed -i "s/tag:.*/tag: ${DOCKER_TAG}/" values-prod.yml
+          # Modifier le tag proprement avec des guillemets
+          sed -i '/^  tag:/c\  tag: "'"${DOCKER_TAG}"'"' values-prod.yml
           
-          # Configuration production
-          echo -e "\\n# Configuration production" >> values-prod.yml
-          echo "replicaCount: 3" >> values-prod.yml
-          echo "resources:" >> values-prod.yml
-          echo "  limits:" >> values-prod.yml
-          echo "    cpu: 500m" >> values-prod.yml
-          echo "    memory: 512Mi" >> values-prod.yml
-          echo "  requests:" >> values-prod.yml
-          echo "    cpu: 200m" >> values-prod.yml
-          echo "    memory: 256Mi" >> values-prod.yml
+          # Modifier replicaCount
+          sed -i '/^replicaCount:/c\replicaCount: 3' values-prod.yml
+          
+          # Ajouter les ressources - méthode propre
+          # D'abord, vérifier si la section resources existe
+          if ! grep -q "^resources:" values-prod.yml; then
+            # Ajouter la section resources si elle n'existe pas
+            echo "" >> values-prod.yml
+            echo "resources:" >> values-prod.yml
+          fi
+          
+          # Ajouter ou modifier les limites
+          if grep -q "limits:" values-prod.yml; then
+            # Modifier les limites existantes
+            sed -i '/^  limits:/,/^  [a-zA-Z]/ { /^    cpu:/c\    cpu: 500m' values-prod.yml; } || true
+            sed -i '/^  limits:/,/^  [a-zA-Z]/ { /^    memory:/c\    memory: 512Mi' values-prod.yml; } || true
+          else
+            # Ajouter les limites
+            sed -i '/^resources:/a\  limits:\n    cpu: 500m\n    memory: 512Mi' values-prod.yml
+          fi
+          
+          # Ajouter ou modifier les requests
+          if grep -q "requests:" values-prod.yml; then
+            # Modifier les requests existantes
+            sed -i '/^  requests:/,/^  [a-zA-Z]/ { /^    cpu:/c\    cpu: 200m' values-prod.yml; } || true
+            sed -i '/^  requests:/,/^  [a-zA-Z]/ { /^    memory:/c\    memory: 256Mi' values-prod.yml; } || true
+          else
+            # Ajouter les requests
+            sed -i '/^  limits:/a\  requests:\n    cpu: 200m\n    memory: 256Mi' values-prod.yml
+          fi
+          
+          # Vérifier le fichier YAML avant déploiement
+          echo "Vérification du fichier YAML..."
+          if command -v yq >/dev/null 2>&1; then
+            yq eval '.' values-prod.yml > /dev/null && echo "✓ Syntaxe YAML valide"
+          elif command -v python3 >/dev/null 2>&1; then
+            python3 -c "import yaml; yaml.safe_load(open('values-prod.yml'))" && echo "✓ Syntaxe YAML valide"
+          fi
           
           # Déployer avec plus de vérifications
           helm upgrade --install app fastapi \
