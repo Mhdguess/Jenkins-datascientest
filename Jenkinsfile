@@ -8,7 +8,7 @@ pipeline {
   
   // AJOUT : Configuration du polling pour déclenchement automatique
   triggers {
-    pollSCM('H/5 * * * *')  // Vérifie les changements toutes les 5 minutes
+    pollSCM('* * * * *')  // Vérifie les changements toutes les minutes
   }
   
   stages {
