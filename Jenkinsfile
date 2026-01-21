@@ -126,8 +126,8 @@ pipeline {
           
           # 6. Préparer le fichier values pour Helm - CORRECTION ICI
           cp fastapi/values.yaml values-dev.yml
-          # Modifier le tag proprement avec des guillemets
-          sed -i '/^  tag:/c\  tag: "'"${DOCKER_TAG}"'"' values-dev.yml
+          # Modifier le tag proprement - VERSION CORRIGÉE
+          sed -i 's/^  tag:.*/  tag: "'"${DOCKER_TAG}"'"/' values-dev.yml
           
           echo "Valeurs utilisées pour le déploiement:"
           cat values-dev.yml | grep -A2 -B2 "tag:"
@@ -170,14 +170,13 @@ pipeline {
           
           # Préparer values - CORRECTION ICI
           cp fastapi/values.yaml values-staging.yml
-          # Modifier le tag proprement avec des guillemets
-          sed -i '/^  tag:/c\  tag: "'"${DOCKER_TAG}"'"' values-staging.yml
+          # Modifier le tag proprement - VERSION CORRIGÉE
+          sed -i 's/^  tag:.*/  tag: "'"${DOCKER_TAG}"'"/' values-staging.yml
           
-          # Modifier replicaCount proprement
-          sed -i '/^replicaCount:/c\replicaCount: 2' values-staging.yml
+          # Modifier replicaCount proprement - VERSION CORRIGÉE
+          sed -i 's/^replicaCount:.*/replicaCount: 2/' values-staging.yml
           
-          # NE PAS utiliser echo pour ajouter du contenu (cela cause l'erreur YAML)
-          # À la place, vérifier que les modifications sont correctes
+          # Vérifier que les modifications sont correctes
           echo "Vérification des modifications:"
           grep -n -E "(tag:|replicaCount:)" values-staging.yml
           
@@ -215,54 +214,34 @@ pipeline {
           
           # Préparer values avec spécificités production - CORRECTION ICI
           cp fastapi/values.yaml values-prod.yml
-          # Modifier le tag proprement avec des guillemets
-          sed -i '/^  tag:/c\  tag: "'"${DOCKER_TAG}"'"' values-prod.yml
+          # Modifier le tag proprement - VERSION CORRIGÉE
+          sed -i 's/^  tag:.*/  tag: "'"${DOCKER_TAG}"'"/' values-prod.yml
           
-          # Modifier replicaCount
-          sed -i '/^replicaCount:/c\replicaCount: 3' values-prod.yml
+          # Modifier replicaCount - VERSION CORRIGÉE
+          sed -i 's/^replicaCount:.*/replicaCount: 3/' values-prod.yml
           
-          # Ajouter les ressources - méthode propre
-          # D'abord, vérifier si la section resources existe
-          if ! grep -q "^resources:" values-prod.yml; then
-            # Ajouter la section resources si elle n'existe pas
-            echo "" >> values-prod.yml
-            echo "resources:" >> values-prod.yml
-          fi
+          # Méthode alternative pour éviter les problèmes de sed complexes
+          # Créer un fichier temporaire avec les overrides
+          cat > prod-overrides.yml << EOF
+image:
+  tag: ${DOCKER_TAG}
+replicaCount: 3
+resources:
+  limits:
+    cpu: 500m
+    memory: 512Mi
+  requests:
+    cpu: 200m
+    memory: 256Mi
+EOF
           
-          # Ajouter ou modifier les limites
-          if grep -q "limits:" values-prod.yml; then
-            # Modifier les limites existantes
-            sed -i '/^  limits:/,/^  [a-zA-Z]/ { /^    cpu:/c\    cpu: 500m' values-prod.yml; } || true
-            sed -i '/^  limits:/,/^  [a-zA-Z]/ { /^    memory:/c\    memory: 512Mi' values-prod.yml; } || true
-          else
-            # Ajouter les limites
-            sed -i '/^resources:/a\  limits:\n    cpu: 500m\n    memory: 512Mi' values-prod.yml
-          fi
-          
-          # Ajouter ou modifier les requests
-          if grep -q "requests:" values-prod.yml; then
-            # Modifier les requests existantes
-            sed -i '/^  requests:/,/^  [a-zA-Z]/ { /^    cpu:/c\    cpu: 200m' values-prod.yml; } || true
-            sed -i '/^  requests:/,/^  [a-zA-Z]/ { /^    memory:/c\    memory: 256Mi' values-prod.yml; } || true
-          else
-            # Ajouter les requests
-            sed -i '/^  limits:/a\  requests:\n    cpu: 200m\n    memory: 256Mi' values-prod.yml
-          fi
-          
-          # Vérifier le fichier YAML avant déploiement
-          echo "Vérification du fichier YAML..."
-          if command -v yq >/dev/null 2>&1; then
-            yq eval '.' values-prod.yml > /dev/null && echo "✓ Syntaxe YAML valide"
-          elif command -v python3 >/dev/null 2>&1; then
-            python3 -c "import yaml; yaml.safe_load(open('values-prod.yml'))" && echo "✓ Syntaxe YAML valide"
-          fi
-          
-          # Déployer avec plus de vérifications
+          # Déployer avec les overrides
           helm upgrade --install app fastapi \
-            --values=values-prod.yml \
             --namespace prod \
             --kubeconfig=.kube/config \
             --create-namespace \
+            --values=fastapi/values.yaml \
+            --values=prod-overrides.yml \
             --wait \
             --timeout 10m \
             --atomic \
