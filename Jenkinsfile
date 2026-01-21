@@ -96,11 +96,11 @@ pipeline {
       }
     }
     
-    stage('Gestion du Cluster Kubernetes') {
+    stage('Déploiement DEV') {
       steps {
         script {
           sh '''
-          echo "=== CONFIGURATION DU CLUSTER KUBERNETES ==="
+          echo "=== DÉPLOIEMENT ENVIRONNEMENT DEV ==="
           mkdir -p .kube
           cp /var/lib/jenkins/.kube/config .kube/config
           KUBECONFIG=".kube/config"
@@ -109,39 +109,26 @@ pipeline {
           echo "1. Suppression du taint disk-pressure..."
           kubectl taint nodes --all node.kubernetes.io/disk-pressure:NoSchedule- --kubeconfig=$KUBECONFIG 2>/dev/null || true
           
-          # 2. NETTOYAGE COMPLET - Supprimer tous les déploiements et services existants
-          echo "2. Nettoyage complet des ressources existantes..."
-          for ns in dev staging prod; do
-            echo "--- Nettoyage namespace $ns ---"
-            # Supprimer les déploiements
-            kubectl delete deployment fastapi-dev -n $ns --ignore-not-found=true --kubeconfig=$KUBECONFIG
-            kubectl delete deployment fastapi-staging -n $ns --ignore-not-found=true --kubeconfig=$KUBECONFIG
-            kubectl delete deployment fastapi-prod -n $ns --ignore-not-found=true --kubeconfig=$KUBECONFIG
-            kubectl delete deployment app-fastapi -n $ns --ignore-not-found=true --kubeconfig=$KUBECONFIG
-            
-            # Supprimer les services
-            kubectl delete svc fastapi-dev -n $ns --ignore-not-found=true --kubeconfig=$KUBECONFIG
-            kubectl delete svc fastapi-staging -n $ns --ignore-not-found=true --kubeconfig=$KUBECONFIG
-            kubectl delete svc fastapi-prod -n $ns --ignore-not-found=true --kubeconfig=$KUBECONFIG
-            kubectl delete svc app-fastapi -n $ns --ignore-not-found=true --kubeconfig=$KUBECONFIG
-            
-            # Supprimer tous les pods restants
-            kubectl delete pods --all -n $ns --kubeconfig=$KUBECONFIG --ignore-not-found=true
-          done
+          # 2. NETTOYAGE COMPLET - Supprimer tous les déploiements et services existants EN DEV
+          echo "2. Nettoyage des ressources DEV..."
+          echo "--- Nettoyage namespace dev ---"
+          kubectl delete deployment fastapi-dev -n dev --ignore-not-found=true --kubeconfig=$KUBECONFIG
+          kubectl delete deployment app-fastapi -n dev --ignore-not-found=true --kubeconfig=$KUBECONFIG
+          kubectl delete svc fastapi-dev -n dev --ignore-not-found=true --kubeconfig=$KUBECONFIG
+          kubectl delete svc app-fastapi -n dev --ignore-not-found=true --kubeconfig=$KUBECONFIG
+          kubectl delete pods --all -n dev --kubeconfig=$KUBECONFIG --ignore-not-found=true
           
           # Attendre que tout soit supprimé
           sleep 5
           
-          # 3. Créer les namespaces s'ils n'existent pas
-          echo "3. Création des namespaces..."
-          for ns in dev staging prod; do
-            kubectl create namespace $ns --dry-run=client -o yaml --kubeconfig=$KUBECONFIG | kubectl apply -f - --kubeconfig=$KUBECONFIG
-          done
+          # 3. Créer le namespace s'il n'existe pas
+          echo "3. Création du namespace dev..."
+          kubectl create namespace dev --dry-run=client -o yaml --kubeconfig=$KUBECONFIG | kubectl apply -f - --kubeconfig=$KUBECONFIG
           
-          # 4. Créer les déploiements AVEC des ports NodePort AUTO (pas fixés)
-          echo "4. Création des déploiements avec ports automatiques..."
+          # 4. Créer le déploiement DEV
+          echo "4. Création du déploiement DEV..."
           
-          cat > all-deployments.yaml << EOF
+          cat > deployment-dev.yaml << EOF
 ---
 apiVersion: apps/v1
 kind: Deployment
@@ -194,7 +181,121 @@ spec:
   ports:
   - port: 80
     targetPort: 80
-    # NE PAS spécifier nodePort, laisser Kubernetes choisir
+EOF
+          
+          echo "5. Application du déploiement DEV..."
+          kubectl apply -f deployment-dev.yaml --kubeconfig=$KUBECONFIG
+          
+          # 6. Vérification DEV
+          echo "6. Vérification du déploiement DEV..."
+          echo "--- Namespace: dev ---"
+          kubectl get deployments,svc -n dev --kubeconfig=$KUBECONFIG
+          
+          # 7. Attendre et vérifier le pod DEV
+          echo "7. Attente du démarrage du pod DEV..."
+          for attempt in {1..30}; do
+            POD_NAME=$(kubectl get pods -n dev -l app=fastapi,env=dev -o jsonpath='{.items[0].metadata.name}' --kubeconfig=$KUBECONFIG 2>/dev/null || echo "")
+            
+            if [ -n "$POD_NAME" ]; then
+              POD_STATUS=$(kubectl get pod $POD_NAME -n dev -o jsonpath='{.status.phase}' --kubeconfig=$KUBECONFIG 2>/dev/null || echo "NotFound")
+              
+              if [ "$POD_STATUS" = "Running" ]; then
+                echo "  ✓ DEV: Pod $POD_NAME en cours d'exécution"
+                break
+              elif [ "$POD_STATUS" = "Pending" ] || [ "$POD_STATUS" = "ContainerCreating" ]; then
+                echo "  ⏳ DEV: Pod en attente ($POD_STATUS) - tentative $attempt/30"
+              else
+                echo "  ⚠ DEV: Statut $POD_STATUS"
+              fi
+            else
+              echo "  ❌ DEV: Aucun pod trouvé - tentative $attempt/30"
+            fi
+            
+            if [ $attempt -eq 30 ]; then
+              echo "⚠ Pod DEV n'est pas encore prêt, continuons quand même"
+            fi
+            
+            sleep 2
+          done
+          
+          # 8. Affichage DEV
+          echo "8. État DEV:"
+          echo "=== dev ==="
+          echo "Déploiements:"
+          kubectl get deployments -n dev --kubeconfig=$KUBECONFIG
+          echo ""
+          echo "Services:"
+          kubectl get svc -n dev --kubeconfig=$KUBECONFIG
+          echo ""
+          echo "Pods:"
+          kubectl get pods -n dev --kubeconfig=$KUBECONFIG -o wide
+          echo ""
+          
+          NODE_PORT=$(kubectl get svc fastapi-dev -n dev -o jsonpath='{.spec.ports[0].nodePort}' --kubeconfig=$KUBECONFIG 2>/dev/null || echo "N/A")
+          CLUSTER_IP=$(kubectl get svc fastapi-dev -n dev -o jsonpath='{.spec.clusterIP}' --kubeconfig=$KUBECONFIG 2>/dev/null || echo "N/A")
+          echo "Accès DEV: http://<NODE_IP>:$NODE_PORT (ClusterIP: $CLUSTER_IP)"
+          '''
+        }
+      }
+    }
+    
+    stage('Tests DEV') {
+      steps {
+        script {
+          sh '''
+          echo "=== TESTS ENVIRONNEMENT DEV ==="
+          KUBECONFIG=".kube/config"
+          
+          # Récupérer les infos pour tester
+          NODE_IP=$(kubectl get nodes -o jsonpath='{.items[0].status.addresses[?(@.type=="InternalIP")].address}' --kubeconfig=$KUBECONFIG 2>/dev/null || echo "localhost")
+          NODE_PORT=$(kubectl get svc fastapi-dev -n dev -o jsonpath='{.spec.ports[0].nodePort}' --kubeconfig=$KUBECONFIG 2>/dev/null || echo "")
+          
+          if [ -n "$NODE_PORT" ]; then
+            echo "Test de l'application DEV sur $NODE_IP:$NODE_PORT..."
+            for i in {1..5}; do
+              if curl -s -f http://$NODE_IP:$NODE_PORT > /dev/null; then
+                echo "✓ Test DEV réussi à la tentative $i"
+                curl http://$NODE_IP:$NODE_PORT
+                break
+              else
+                echo "Tentative $i/5 échouée, attente de 2 secondes..."
+                sleep 2
+              fi
+            done
+          else
+            echo "⚠ Impossible de récupérer le NodePort DEV"
+          fi
+          '''
+        }
+      }
+    }
+    
+    stage('Déploiement STAGING') {
+      steps {
+        script {
+          sh '''
+          echo "=== DÉPLOIEMENT ENVIRONNEMENT STAGING ==="
+          KUBECONFIG=".kube/config"
+          
+          # 1. NETTOYAGE COMPLET - Supprimer tous les déploiements et services existants EN STAGING
+          echo "1. Nettoyage des ressources STAGING..."
+          echo "--- Nettoyage namespace staging ---"
+          kubectl delete deployment fastapi-staging -n staging --ignore-not-found=true --kubeconfig=$KUBECONFIG
+          kubectl delete deployment app-fastapi -n staging --ignore-not-found=true --kubeconfig=$KUBECONFIG
+          kubectl delete svc fastapi-staging -n staging --ignore-not-found=true --kubeconfig=$KUBECONFIG
+          kubectl delete svc app-fastapi -n staging --ignore-not-found=true --kubeconfig=$KUBECONFIG
+          kubectl delete pods --all -n staging --kubeconfig=$KUBECONFIG --ignore-not-found=true
+          
+          sleep 3
+          
+          # 2. Créer le namespace s'il n'existe pas
+          echo "2. Création du namespace staging..."
+          kubectl create namespace staging --dry-run=client -o yaml --kubeconfig=$KUBECONFIG | kubectl apply -f - --kubeconfig=$KUBECONFIG
+          
+          # 3. Créer le déploiement STAGING
+          echo "3. Création du déploiement STAGING..."
+          
+          cat > deployment-staging.yaml << EOF
 ---
 apiVersion: apps/v1
 kind: Deployment
@@ -247,6 +348,130 @@ spec:
   ports:
   - port: 80
     targetPort: 80
+EOF
+          
+          echo "4. Application du déploiement STAGING..."
+          kubectl apply -f deployment-staging.yaml --kubeconfig=$KUBECONFIG
+          
+          # 5. Vérification STAGING
+          echo "5. Vérification du déploiement STAGING..."
+          echo "--- Namespace: staging ---"
+          kubectl get deployments,svc -n staging --kubeconfig=$KUBECONFIG
+          
+          # 6. Attendre et vérifier le pod STAGING
+          echo "6. Attente du démarrage du pod STAGING..."
+          for attempt in {1..30}; do
+            POD_NAME=$(kubectl get pods -n staging -l app=fastapi,env=staging -o jsonpath='{.items[0].metadata.name}' --kubeconfig=$KUBECONFIG 2>/dev/null || echo "")
+            
+            if [ -n "$POD_NAME" ]; then
+              POD_STATUS=$(kubectl get pod $POD_NAME -n staging -o jsonpath='{.status.phase}' --kubeconfig=$KUBECONFIG 2>/dev/null || echo "NotFound")
+              
+              if [ "$POD_STATUS" = "Running" ]; then
+                echo "  ✓ STAGING: Pod $POD_NAME en cours d'exécution"
+                break
+              elif [ "$POD_STATUS" = "Pending" ] || [ "$POD_STATUS" = "ContainerCreating" ]; then
+                echo "  ⏳ STAGING: Pod en attente ($POD_STATUS) - tentative $attempt/30"
+              else
+                echo "  ⚠ STAGING: Statut $POD_STATUS"
+              fi
+            else
+              echo "  ❌ STAGING: Aucun pod trouvé - tentative $attempt/30"
+            fi
+            
+            if [ $attempt -eq 30 ]; then
+              echo "⚠ Pod STAGING n'est pas encore prêt, continuons quand même"
+            fi
+            
+            sleep 2
+          done
+          
+          # 7. Affichage STAGING
+          echo "7. État STAGING:"
+          echo "=== staging ==="
+          echo "Déploiements:"
+          kubectl get deployments -n staging --kubeconfig=$KUBECONFIG
+          echo ""
+          echo "Services:"
+          kubectl get svc -n staging --kubeconfig=$KUBECONFIG
+          echo ""
+          echo "Pods:"
+          kubectl get pods -n staging --kubeconfig=$KUBECONFIG -o wide
+          echo ""
+          
+          NODE_PORT=$(kubectl get svc fastapi-staging -n staging -o jsonpath='{.spec.ports[0].nodePort}' --kubeconfig=$KUBECONFIG 2>/dev/null || echo "N/A")
+          CLUSTER_IP=$(kubectl get svc fastapi-staging -n staging -o jsonpath='{.spec.clusterIP}' --kubeconfig=$KUBECONFIG 2>/dev/null || echo "N/A")
+          echo "Accès STAGING: http://<NODE_IP>:$NODE_PORT (ClusterIP: $CLUSTER_IP)"
+          '''
+        }
+      }
+    }
+    
+    stage('Tests STAGING') {
+      steps {
+        script {
+          sh '''
+          echo "=== TESTS ENVIRONNEMENT STAGING ==="
+          KUBECONFIG=".kube/config"
+          
+          # Récupérer les infos pour tester
+          NODE_IP=$(kubectl get nodes -o jsonpath='{.items[0].status.addresses[?(@.type=="InternalIP")].address}' --kubeconfig=$KUBECONFIG 2>/dev/null || echo "localhost")
+          NODE_PORT=$(kubectl get svc fastapi-staging -n staging -o jsonpath='{.spec.ports[0].nodePort}' --kubeconfig=$KUBECONFIG 2>/dev/null || echo "")
+          
+          if [ -n "$NODE_PORT" ]; then
+            echo "Test de l'application STAGING sur $NODE_IP:$NODE_PORT..."
+            for i in {1..5}; do
+              if curl -s -f http://$NODE_IP:$NODE_PORT > /dev/null; then
+                echo "✓ Test STAGING réussi à la tentative $i"
+                curl http://$NODE_IP:$NODE_PORT
+                break
+              else
+                echo "Tentative $i/5 échouée, attente de 2 secondes..."
+                sleep 2
+              fi
+            done
+          else
+            echo "⚠ Impossible de récupérer le NodePort STAGING"
+          fi
+          '''
+        }
+      }
+    }
+    
+    // ÉTAPE DE VALIDATION MANUELLE POUR LA PRODUCTION
+    stage('Validation pour PRODUCTION') {
+      steps {
+        timeout(time: 15, unit: 'MINUTES') {
+          input message: 'Voulez-vous déployer en PRODUCTION ?', ok: 'Oui, déployer en PRODUCTION'
+        }
+      }
+    }
+    
+    stage('Déploiement PRODUCTION') {
+      steps {
+        script {
+          sh '''
+          echo "=== DÉPLOIEMENT ENVIRONNEMENT PRODUCTION ==="
+          KUBECONFIG=".kube/config"
+          
+          # 1. NETTOYAGE COMPLET - Supprimer tous les déploiements et services existants EN PROD
+          echo "1. Nettoyage des ressources PRODUCTION..."
+          echo "--- Nettoyage namespace prod ---"
+          kubectl delete deployment fastapi-prod -n prod --ignore-not-found=true --kubeconfig=$KUBECONFIG
+          kubectl delete deployment app-fastapi -n prod --ignore-not-found=true --kubeconfig=$KUBECONFIG
+          kubectl delete svc fastapi-prod -n prod --ignore-not-found=true --kubeconfig=$KUBECONFIG
+          kubectl delete svc app-fastapi -n prod --ignore-not-found=true --kubeconfig=$KUBECONFIG
+          kubectl delete pods --all -n prod --kubeconfig=$KUBECONFIG --ignore-not-found=true
+          
+          sleep 3
+          
+          # 2. Créer le namespace s'il n'existe pas
+          echo "2. Création du namespace prod..."
+          kubectl create namespace prod --dry-run=client -o yaml --kubeconfig=$KUBECONFIG | kubectl apply -f - --kubeconfig=$KUBECONFIG
+          
+          # 3. Créer le déploiement PRODUCTION
+          echo "3. Création du déploiement PRODUCTION..."
+          
+          cat > deployment-prod.yaml << EOF
 ---
 apiVersion: apps/v1
 kind: Deployment
@@ -254,7 +479,7 @@ metadata:
   name: fastapi-prod
   namespace: prod
 spec:
-  replicas: 1
+  replicas: 2  # Augmenter à 2 réplicas en production
   selector:
     matchLabels:
       app: fastapi
@@ -280,11 +505,11 @@ spec:
         - containerPort: 80
         resources:
           requests:
-            memory: "32Mi"
-            cpu: "10m"
-          limits:
-            memory: "64Mi"
+            memory: "64Mi"  # Augmenter les ressources en production
             cpu: "50m"
+          limits:
+            memory: "128Mi"
+            cpu: "100m"
 ---
 apiVersion: v1
 kind: Service
@@ -301,81 +526,81 @@ spec:
     targetPort: 80
 EOF
           
-          echo "5. Application des déploiements..."
-          kubectl apply -f all-deployments.yaml --kubeconfig=$KUBECONFIG
+          echo "4. Application du déploiement PRODUCTION..."
+          kubectl apply -f deployment-prod.yaml --kubeconfig=$KUBECONFIG
           
-          # 6. Vérification
-          echo "6. Vérification des déploiements..."
-          for ns in dev staging prod; do
-            echo "--- Namespace: $ns ---"
-            kubectl get deployments,svc -n $ns --kubeconfig=$KUBECONFIG
-          done
+          # 5. Vérification PRODUCTION
+          echo "5. Vérification du déploiement PRODUCTION..."
+          echo "--- Namespace: prod ---"
+          kubectl get deployments,svc -n prod --kubeconfig=$KUBECONFIG
           
-          # 7. Attendre et vérifier les pods
-          echo "7. Attente du démarrage des pods..."
-          for attempt in {1..30}; do
-            echo "Tentative $attempt/30..."
+          # 6. Attendre et vérifier les pods PRODUCTION
+          echo "6. Attente du démarrage des pods PRODUCTION..."
+          for attempt in {1..40}; do  # Plus de temps pour la production
+            POD_COUNT=$(kubectl get pods -n prod -l app=fastapi,env=prod --no-headers --kubeconfig=$KUBECONFIG 2>/dev/null | wc -l || echo "0")
+            RUNNING_COUNT=$(kubectl get pods -n prod -l app=fastapi,env=prod --field-selector=status.phase=Running --no-headers --kubeconfig=$KUBECONFIG 2>/dev/null | wc -l || echo "0")
             
-            # Vérifier l'état de chaque namespace
-            ALL_RUNNING=true
-            for ns in dev staging prod; do
-              # Récupérer le nom du pod
-              POD_NAME=$(kubectl get pods -n $ns -l app=fastapi -o jsonpath='{.items[0].metadata.name}' --kubeconfig=$KUBECONFIG 2>/dev/null || echo "")
-              
-              if [ -n "$POD_NAME" ]; then
-                POD_STATUS=$(kubectl get pod $POD_NAME -n $ns -o jsonpath='{.status.phase}' --kubeconfig=$KUBECONFIG 2>/dev/null || echo "NotFound")
-                
-                if [ "$POD_STATUS" = "Running" ]; then
-                  echo "  ✓ $ns: Pod $POD_NAME en cours d'exécution"
-                elif [ "$POD_STATUS" = "Pending" ] || [ "$POD_STATUS" = "ContainerCreating" ]; then
-                  echo "  ⏳ $ns: Pod en attente ($POD_STATUS)"
-                  ALL_RUNNING=false
-                else
-                  echo "  ⚠ $ns: Statut $POD_STATUS"
-                  # Afficher les détails si en échec
-                  if [ "$POD_STATUS" = "Failed" ] || [ "$POD_STATUS" = "Evicted" ]; then
-                    kubectl describe pod $POD_NAME -n $ns --kubeconfig=$KUBECONFIG | tail -20
-                  fi
-                  ALL_RUNNING=false
-                fi
-              else
-                echo "  ❌ $ns: Aucun pod trouvé"
-                ALL_RUNNING=false
-              fi
-            done
-            
-            if [ "$ALL_RUNNING" = true ]; then
-              echo "✓✓✓ Tous les pods sont en cours d'exécution ✓✓✓"
+            if [ "$POD_COUNT" -eq 2 ] && [ "$RUNNING_COUNT" -eq 2 ]; then
+              echo "  ✓ PRODUCTION: 2/2 pods en cours d'exécution"
               break
+            else
+              echo "  ⏳ PRODUCTION: $RUNNING_COUNT/$POD_COUNT pods prêts - tentative $attempt/40"
             fi
             
-            if [ $attempt -eq 30 ]; then
-              echo "⚠ Certains pods ne sont pas encore prêts, continuons quand même"
+            if [ $attempt -eq 40 ]; then
+              echo "⚠ Pods PRODUCTION pas tous prêts, continuons quand même"
             fi
             
             sleep 2
           done
           
-          # 8. Affichage final détaillé
-          echo "8. État final détaillé:"
-          for ns in dev staging prod; do
-            echo ""
-            echo "=== $ns ==="
-            echo "Déploiements:"
-            kubectl get deployments -n $ns --kubeconfig=$KUBECONFIG
-            echo ""
-            echo "Services:"
-            kubectl get svc -n $ns --kubeconfig=$KUBECONFIG
-            echo ""
-            echo "Pods:"
-            kubectl get pods -n $ns --kubeconfig=$KUBECONFIG -o wide
-            echo ""
-            
-            # Afficher les NodePorts attribués
-            NODE_PORT=$(kubectl get svc -n $ns -l app=fastapi -o jsonpath='{.items[0].spec.ports[0].nodePort}' --kubeconfig=$KUBECONFIG 2>/dev/null || echo "N/A")
-            CLUSTER_IP=$(kubectl get svc -n $ns -l app=fastapi -o jsonpath='{.items[0].spec.clusterIP}' --kubeconfig=$KUBECONFIG 2>/dev/null || echo "N/A")
-            echo "Accès: http://<NODE_IP>:$NODE_PORT (ClusterIP: $CLUSTER_IP)"
-          done
+          # 7. Affichage PRODUCTION
+          echo "7. État PRODUCTION:"
+          echo "=== prod ==="
+          echo "Déploiements:"
+          kubectl get deployments -n prod --kubeconfig=$KUBECONFIG
+          echo ""
+          echo "Services:"
+          kubectl get svc -n prod --kubeconfig=$KUBECONFIG
+          echo ""
+          echo "Pods:"
+          kubectl get pods -n prod --kubeconfig=$KUBECONFIG -o wide
+          echo ""
+          
+          NODE_PORT=$(kubectl get svc fastapi-prod -n prod -o jsonpath='{.spec.ports[0].nodePort}' --kubeconfig=$KUBECONFIG 2>/dev/null || echo "N/A")
+          CLUSTER_IP=$(kubectl get svc fastapi-prod -n prod -o jsonpath='{.spec.clusterIP}' --kubeconfig=$KUBECONFIG 2>/dev/null || echo "N/A")
+          echo "Accès PRODUCTION: http://<NODE_IP>:$NODE_PORT (ClusterIP: $CLUSTER_IP)"
+          '''
+        }
+      }
+    }
+    
+    stage('Tests PRODUCTION') {
+      steps {
+        script {
+          sh '''
+          echo "=== TESTS ENVIRONNEMENT PRODUCTION ==="
+          KUBECONFIG=".kube/config"
+          
+          # Récupérer les infos pour tester
+          NODE_IP=$(kubectl get nodes -o jsonpath='{.items[0].status.addresses[?(@.type=="InternalIP")].address}' --kubeconfig=$KUBECONFIG 2>/dev/null || echo "localhost")
+          NODE_PORT=$(kubectl get svc fastapi-prod -n prod -o jsonpath='{.spec.ports[0].nodePort}' --kubeconfig=$KUBECONFIG 2>/dev/null || echo "")
+          
+          if [ -n "$NODE_PORT" ]; then
+            echo "Test de l'application PRODUCTION sur $NODE_IP:$NODE_PORT..."
+            for i in {1..5}; do
+              if curl -s -f http://$NODE_IP:$NODE_PORT > /dev/null; then
+                echo "✓ Test PRODUCTION réussi à la tentative $i"
+                curl http://$NODE_IP:$NODE_PORT
+                break
+              else
+                echo "Tentative $i/5 échouée, attente de 2 secondes..."
+                sleep 2
+              fi
+            done
+          else
+            echo "⚠ Impossible de récupérer le NodePort PRODUCTION"
+          fi
           '''
         }
       }
@@ -425,22 +650,23 @@ EOF
         echo ""
         echo "RÉCAPITULATIF:"
         echo "1. Image Docker construite et publiée avec succès"
-        echo "2. Applications déployées sur Kubernetes (dev, staging, prod)"
-        echo "3. Configuration adaptée pour gérer la pression disque"
+        echo "2. Applications déployées sur Kubernetes"
+        echo "3. Déploiement progressif avec validation manuelle pour la production"
         echo ""
         echo "NEXT STEPS:"
         echo "1. Récupérer l'adresse IP de votre nœud:"
         echo "   kubectl get nodes -o wide"
         echo ""
         echo "2. Tester l'accès aux applications:"
-        echo "   curl http://<NODE_IP>:<NODE_PORT_DEV>"
-        echo "   curl http://<NODE_IP>:<NODE_PORT_STAGING>"
-        echo "   curl http://<NODE_IP>:<NODE_PORT_PROD>"
+        for ns in dev staging prod; do
+          NODE_PORT=$(kubectl get svc fastapi-$ns -n $ns -o jsonpath='{.spec.ports[0].nodePort}' 2>/dev/null || echo "N/A")
+          if [ "$NODE_PORT" != "N/A" ]; then
+            echo "   $ns: curl http://<NODE_IP>:$NODE_PORT"
+          fi
+        done
         echo ""
-        echo "3. Pour libérer durablement de l'espace disque:"
-        echo "   - Nettoyer régulièrement: docker system prune -a -f"
-        echo "   - Étendre la partition si possible"
-        echo "   - Configurer des limites de stockage"
+        echo "3. Pour la production: surveiller les logs et métriques"
+        echo "   kubectl logs -n prod -l app=fastapi --tail=10"
         '''
       }
     }
