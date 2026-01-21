@@ -93,75 +93,72 @@ pipeline {
       }
     }
     
+    stage('Diagnostic Cluster') {
+      steps {
+        script {
+          sh '''
+          echo "=== Diagnostic du cluster ==="
+          mkdir -p .kube
+          cp /var/lib/jenkins/.kube/config .kube/config
+          
+          echo "1. Vérification des nœuds et de leurs taints:"
+          kubectl get nodes -o wide --kubeconfig=.kube/config
+          echo ""
+          echo "2. Détails des taints:"
+          kubectl describe nodes --kubeconfig=.kube/config | grep -A 5 -B 5 Taints || true
+          echo ""
+          echo "3. Taints exacts:"
+          kubectl get nodes -o jsonpath="{.items[*].spec.taints}" --kubeconfig=.kube/config
+          echo ""
+          
+          echo "4. Vérification des pods existants:"
+          kubectl get pods -A --kubeconfig=.kube/config | grep -v Completed || true
+          '''
+        }
+      }
+    }
+    
     stage('Déploiement en dev') {
       steps {
         script {
           sh '''
           echo "=== Déploiement en développement ==="
           
-          # 1. Utiliser le kubeconfig de Jenkins
-          mkdir -p .kube
-          cp /var/lib/jenkins/.kube/config .kube/config
+          # Réutiliser le kubeconfig
+          KUBECONFIG=".kube/config"
           
-          # 2. Vérifier que la connexion fonctionne
-          echo "Test de connexion au cluster..."
-          kubectl cluster-info --kubeconfig=.kube/config || {
-            echo "Échec avec les certificats, tentative sans vérification TLS..."
-            # Modifier le kubeconfig pour ignorer TLS
-            sed -i 's/certificate-authority-data:/insecure-skip-tls-verify: true\\n    certificate-authority-data:/' .kube/config
-          }
+          # Créer namespace dev
+          kubectl create namespace dev --dry-run=client -o yaml | kubectl apply -f - --kubeconfig=$KUBECONFIG || true
           
-          # 3. Vérifier à nouveau
-          kubectl cluster-info --kubeconfig=.kube/config || {
-            echo "Impossible de se connecter au cluster"
-            exit 1
-          }
+          # Nettoyer les anciens déploiements
+          echo "Nettoyage des anciens déploiements..."
+          kubectl delete deployment app-fastapi -n dev --ignore-not-found=true --kubeconfig=$KUBECONFIG
+          kubectl delete replicaset -n dev -l app.kubernetes.io/name=fastapi --ignore-not-found=true --kubeconfig=$KUBECONFIG
           
-          # 4. Vérifier le contexte actuel
-          CURRENT_CONTEXT=$(kubectl config current-context --kubeconfig=.kube/config)
-          echo "Contexte actuel: $CURRENT_CONTEXT"
-          
-          # 5. Créer le namespace si nécessaire
-          kubectl create namespace dev --dry-run=client -o yaml | kubectl apply -f - --kubeconfig=.kube/config || true
-          
-          # 6. Préparer le fichier values pour Helm - SOLUTION COMPLÈTE
-          # Créer un nouveau fichier values au lieu de modifier l'existant
+          # Créer un fichier values complet AVEC NODE SELECTOR
           cat > values-dev.yml << EOF
 replicaCount: 1
 
 image:
   repository: guessod/datascientestapi
   pullPolicy: IfNotPresent
-  # Overrides the image tag whose default is the chart appVersion.
   tag: "${DOCKER_TAG}"
 
-# This is for the secrets for pulling an image from a private repository more information can be found here: https://kubernetes.io/docs/tasks/configure-pod-container/pull-image-private-registry/
 imagePullSecrets: []
 nameOverride: ""
 fullnameOverride: ""
 
 serviceAccount:
-  # Specifies whether a service account should be created
   create: true
-  # Annotations to add to the service account
   annotations: {}
-  # The name of the service account to use.
-  # If not set and create is true, a name is generated using the fullname template
   name: ""
 
 podAnnotations: {}
 podLabels: {}
 
 podSecurityContext: {}
-  # fsGroup: 2000
 
 securityContext: {}
-  # capabilities:
-  #   drop:
-  #   - ALL
-  # readOnlyRootFilesystem: true
-  # runAsNonRoot: true
-  # runAsUser: 1000
 
 service:
   type: NodePort
@@ -171,51 +168,36 @@ ingress:
   enabled: false
   className: ""
   annotations: {}
-    # kubernetes.io/ingress.class: nginx
-    # kubernetes.io/tls-acme: "true"
   hosts:
     - host: chart-example.local
       paths:
         - path: /
           pathType: ImplementationSpecific
   tls: []
-  #  - secretName: chart-example-tls
-  #    hosts:
-  #      - chart-example.local
 
 resources: {}
-  # We usually recommend not to specify default resources and to leave this as a conscious
-  # choice for the user. This also increases chances charts run on environments with little
-  # resources, such as Minikube. If you do want to specify resources, uncomment the following
-  # lines, adjust them as necessary, and remove the curly braces after 'resources:'.
-  # limits:
-  #   cpu: 100m
-  #   memory: 128Mi
-  # requests:
-  #   cpu: 100m
-  #   memory: 128Mi
 
 autoscaling:
   enabled: false
   minReplicas: 1
   maxReplicas: 100
   targetCPUUtilizationPercentage: 80
-  # targetMemoryUtilizationPercentage: 80
 
-nodeSelector: {}
+# SOLUTION: Forcer l'exécution sur le master avec nodeSelector et tolerations
+nodeSelector:
+  node-role.kubernetes.io/control-plane: ""
 
-# CORRECTION: Tolerations pour résoudre le problème de taints
 tolerations:
-- key: "node.kubernetes.io/not-ready"
-  operator: "Exists"
-  effect: "NoSchedule"
-- key: "node.kubernetes.io/unreachable"
-  operator: "Exists"
-  effect: "NoSchedule"
 - key: "node-role.kubernetes.io/control-plane"
   operator: "Exists"
   effect: "NoSchedule"
 - key: "node-role.kubernetes.io/master"
+  operator: "Exists"
+  effect: "NoSchedule"
+- key: "node.kubernetes.io/not-ready"
+  operator: "Exists"
+  effect: "NoSchedule"
+- key: "node.kubernetes.io/unreachable"
   operator: "Exists"
   effect: "NoSchedule"
 
@@ -223,32 +205,35 @@ affinity: {}
 EOF
           
           echo "Valeurs utilisées pour le déploiement:"
-          cat values-dev.yml | grep -A2 -B2 "tag:"
+          cat values-dev.yml | grep -E "(tag:|nodeSelector:|tolerations:)"
           
-          # 7. Déployer avec Helm
+          # Déployer avec Helm
           echo "Exécution de Helm upgrade/install..."
           helm upgrade --install app fastapi \
             --values=values-dev.yml \
             --namespace dev \
-            --kubeconfig=.kube/config \
-            --create-namespace
+            --kubeconfig=$KUBECONFIG \
+            --create-namespace \
+            --wait \
+            --timeout 5m
           
-          # 8. Vérifier le déploiement manuellement
-          echo "Attente du démarrage des pods..."
-          sleep 30
+          echo "Attente supplémentaire..."
+          sleep 15
           
           echo "Vérification du déploiement..."
-          kubectl get pods,svc -n dev --kubeconfig=.kube/config
+          kubectl get pods,svc -n dev --kubeconfig=$KUBECONFIG
           
-          # 9. Vérifier l'état des pods
           echo "Détails des pods:"
-          kubectl describe pods -n dev --selector=app.kubernetes.io/name=fastapi --kubeconfig=.kube/config || true
+          kubectl describe pods -n dev --selector=app.kubernetes.io/name=fastapi --kubeconfig=$KUBECONFIG || true
           
-          # 10. Vérifier les logs si les pods tournent
-          POD_NAME=$(kubectl get pods -n dev -l app.kubernetes.io/name=fastapi -o jsonpath='{.items[0].metadata.name}' --kubeconfig=.kube/config 2>/dev/null || echo "")
-          if [ -n "$POD_NAME" ]; then
+          # Vérifier les logs
+          POD_NAME=$(kubectl get pods -n dev -l app.kubernetes.io/name=fastapi -o jsonpath='{.items[0].metadata.name}' --kubeconfig=$KUBECONFIG 2>/dev/null || echo "")
+          if [ -n "$POD_NAME" ] && kubectl get pod $POD_NAME -n dev --kubeconfig=$KUBECONFIG 2>/dev/null | grep -q Running; then
             echo "Logs du pod $POD_NAME:"
-            kubectl logs $POD_NAME -n dev --kubeconfig=.kube/config --tail=20 || true
+            kubectl logs $POD_NAME -n dev --kubeconfig=$KUBECONFIG --tail=20 || true
+          else
+            echo "Pod pas encore en état Running"
+            kubectl get events -n dev --sort-by='.lastTimestamp' --kubeconfig=$KUBECONFIG | tail -20 || true
           fi
           '''
         }
@@ -262,50 +247,38 @@ EOF
           echo "=== Déploiement en staging ==="
           
           # Réutiliser le même kubeconfig
-          mkdir -p .kube 2>/dev/null || true
-          cp /var/lib/jenkins/.kube/config .kube/config 2>/dev/null || true
           KUBECONFIG=".kube/config"
           
           # Créer namespace staging
           kubectl create namespace staging --dry-run=client -o yaml | kubectl apply -f - --kubeconfig=$KUBECONFIG || true
           
-          # Préparer values - SOLUTION COMPLÈTE
+          # Nettoyer les anciens déploiements
+          kubectl delete deployment app-fastapi -n staging --ignore-not-found=true --kubeconfig=$KUBECONFIG
+          
+          # Créer values avec nodeSelector
           cat > values-staging.yml << EOF
 replicaCount: 2
 
 image:
   repository: guessod/datascientestapi
   pullPolicy: Always
-  # Overrides the image tag whose default is the chart appVersion.
   tag: "${DOCKER_TAG}"
 
-# This is for the secrets for pulling an image from a private repository more information can be found here: https://kubernetes.io/docs/tasks/configure-pod-container/pull-image-private-registry/
 imagePullSecrets: []
 nameOverride: ""
 fullnameOverride: ""
 
 serviceAccount:
-  # Specifies whether a service account should be created
   create: true
-  # Annotations to add to the service account
   annotations: {}
-  # The name of the service account to use.
-  # If not set and create is true, a name is generated using the fullname template
   name: ""
 
 podAnnotations: {}
 podLabels: {}
 
 podSecurityContext: {}
-  # fsGroup: 2000
 
 securityContext: {}
-  # capabilities:
-  #   drop:
-  #   - ALL
-  # readOnlyRootFilesystem: true
-  # runAsNonRoot: true
-  # runAsUser: 1000
 
 service:
   type: NodePort
@@ -315,82 +288,59 @@ ingress:
   enabled: false
   className: ""
   annotations: {}
-    # kubernetes.io/ingress.class: nginx
-    # kubernetes.io/tls-acme: "true"
   hosts:
     - host: chart-example.local
       paths:
         - path: /
           pathType: ImplementationSpecific
   tls: []
-  #  - secretName: chart-example-tls
-  #    hosts:
-  #      - chart-example.local
 
 resources: {}
-  # We usually recommend not to specify default resources and to leave this as a conscious
-  # choice for the user. This also increases chances charts run on environments with little
-  # resources, such as Minikube. If you do want to specify resources, uncomment the following
-  # lines, adjust them as necessary, and remove the curly braces after 'resources:'.
-  # limits:
-  #   cpu: 100m
-  #   memory: 128Mi
-  # requests:
-  #   cpu: 100m
-  #   memory: 128Mi
 
 autoscaling:
   enabled: false
   minReplicas: 1
   maxReplicas: 100
   targetCPUUtilizationPercentage: 80
-  # targetMemoryUtilizationPercentage: 80
 
-nodeSelector: {}
+# SOLUTION: Forcer l'exécution sur le master avec nodeSelector et tolerations
+nodeSelector:
+  node-role.kubernetes.io/control-plane: ""
 
-# CORRECTION: Tolerations pour résoudre le problème de taints
 tolerations:
-- key: "node.kubernetes.io/not-ready"
-  operator: "Exists"
-  effect: "NoSchedule"
-- key: "node.kubernetes.io/unreachable"
-  operator: "Exists"
-  effect: "NoSchedule"
 - key: "node-role.kubernetes.io/control-plane"
   operator: "Exists"
   effect: "NoSchedule"
 - key: "node-role.kubernetes.io/master"
   operator: "Exists"
   effect: "NoSchedule"
+- key: "node.kubernetes.io/not-ready"
+  operator: "Exists"
+  effect: "NoSchedule"
+- key: "node.kubernetes.io/unreachable"
+  operator: "Exists"
+  effect: "NoSchedule"
 
 affinity: {}
 EOF
           
-          echo "Vérification des modifications:"
-          grep -n -E "(tag:|replicaCount:|pullPolicy:|tolerations:)" values-staging.yml
-          
-          # Déployer avec Helm
           echo "Déploiement avec Helm..."
           helm upgrade --install app fastapi \
             --values=values-staging.yml \
             --namespace staging \
             --kubeconfig=$KUBECONFIG \
-            --create-namespace
+            --create-namespace \
+            --wait \
+            --timeout 5m
           
-          # Attendre un peu
-          echo "Attente du démarrage des pods..."
+          echo "Attente supplémentaire..."
           sleep 30
           
           echo "Vérification staging..."
           kubectl get pods -n staging --kubeconfig=$KUBECONFIG
           
-          # Vérifier les événements pour debug
           echo "Événements récents:"
           kubectl get events -n staging --sort-by='.lastTimestamp' --kubeconfig=$KUBECONFIG | tail -10 || true
-          
-          # Vérifier l'état des pods
-          echo "Description des pods:"
-          kubectl describe pods -n staging --selector=app.kubernetes.io/name=fastapi --kubeconfig=$KUBECONFIG 2>/dev/null | head -50 || true
           '''
         }
       }
@@ -406,16 +356,18 @@ EOF
           echo "=== Déploiement en production ==="
           
           # Réutiliser le même kubeconfig
-          mkdir -p .kube 2>/dev/null || true
-          cp /var/lib/jenkins/.kube/config .kube/config 2>/dev/null || true
           KUBECONFIG=".kube/config"
           
           # Créer namespace prod
           kubectl create namespace prod --dry-run=client -o yaml | kubectl apply -f - --kubeconfig=$KUBECONFIG || true
           
-          # Créer un fichier d'overrides séparé pour éviter les problèmes YAML
+          # Nettoyer les anciens déploiements
+          kubectl delete deployment app-fastapi -n prod --ignore-not-found=true --kubeconfig=$KUBECONFIG
+          
+          # Créer un fichier d'overrides complet
           cat > prod-overrides.yml << EOF
 image:
+  repository: guessod/datascientestapi
   tag: ${DOCKER_TAG}
   pullPolicy: Always
 replicaCount: 3
@@ -426,40 +378,43 @@ resources:
   requests:
     cpu: 200m
     memory: 256Mi
-# AJOUT: Tolerations pour résoudre le problème de taints
+
+# SOLUTION: Forcer l'exécution sur le master avec nodeSelector et tolerations
+nodeSelector:
+  node-role.kubernetes.io/control-plane: ""
+
 tolerations:
-- key: "node.kubernetes.io/not-ready"
-  operator: "Exists"
-  effect: "NoSchedule"
-- key: "node.kubernetes.io/unreachable"
-  operator: "Exists"
-  effect: "NoSchedule"
 - key: "node-role.kubernetes.io/control-plane"
   operator: "Exists"
   effect: "NoSchedule"
 - key: "node-role.kubernetes.io/master"
   operator: "Exists"
   effect: "NoSchedule"
+- key: "node.kubernetes.io/not-ready"
+  operator: "Exists"
+  effect: "NoSchedule"
+- key: "node.kubernetes.io/unreachable"
+  operator: "Exists"
+  effect: "NoSchedule"
 EOF
           
-          # Déployer avec Helm - SANS TIMEOUT ET SANS --wait
+          # Déployer avec Helm - utiliser seulement le fichier d'overrides
           helm upgrade --install app fastapi \
             --namespace prod \
             --kubeconfig=$KUBECONFIG \
             --create-namespace \
-            --values=fastapi/values.yaml \
-            --values=prod-overrides.yml
+            --values=prod-overrides.yml \
+            --wait \
+            --timeout 5m
           
-          # Attendre un peu
-          echo "Attente du démarrage des pods..."
+          echo "Attente supplémentaire..."
           sleep 30
           
           echo "Vérification production..."
-          kubectl get pods,svc,ingress -n prod --kubeconfig=$KUBECONFIG
+          kubectl get pods,svc -n prod --kubeconfig=$KUBECONFIG
           
-          # Vérifier les pods en détail
           echo "État détaillé des pods:"
-          kubectl describe pods -n prod --selector=app.kubernetes.io/name=fastapi --kubeconfig=$KUBECONFIG 2>/dev/null | grep -A 20 "Events:" || true
+          kubectl describe pods -n prod --selector=app.kubernetes.io/name=fastapi --kubeconfig=$KUBECONFIG 2>/dev/null | head -100 || true
           
           echo "✓ Déploiement en production lancé!"
           '''
@@ -472,16 +427,22 @@ EOF
     always {
       script {
         sh '''
-        echo "=== Nettoyage ==="
-        # Garder les fichiers pour débogage si nécessaire
+        echo "=== Nettoyage et rapport final ==="
         echo "Fichiers générés:"
         ls -la *.yml 2>/dev/null || true
         
-        # Vérifier l'état final de tous les déploiements
         echo "État final des déploiements:"
         for ns in dev staging prod; do
           echo "--- Namespace $ns ---"
-          kubectl get pods,svc -n $ns --kubeconfig=.kube/config 2>/dev/null || echo "Namespace $ns non accessible"
+          kubectl get pods -n $ns --kubeconfig=.kube/config 2>/dev/null || echo "Namespace $ns non accessible"
+          if kubectl get pods -n $ns --kubeconfig=.kube/config 2>/dev/null | grep -q Running; then
+            echo "✓ Des pods sont en cours d'exécution dans $ns"
+            kubectl get pods -n $ns -o wide --kubeconfig=.kube/config
+          else
+            echo "✗ Aucun pod n'est en cours d'exécution dans $ns"
+            echo "Derniers événements:"
+            kubectl get events -n $ns --sort-by='.lastTimestamp' --kubeconfig=.kube/config | tail -5 2>/dev/null || true
+          fi
         done
         '''
       }
@@ -490,6 +451,10 @@ EOF
       script {
         sh '''
         echo "✓ Pipeline exécuté avec succès!"
+        echo "Résumé:"
+        echo "1. Image Docker construite et push: guessod/datascientestapi:${DOCKER_TAG}"
+        echo "2. Déploiements Kubernetes mis à jour dans dev, staging, prod"
+        echo "3. Vérifiez l'état des pods avec: kubectl get pods -A"
         '''
       }
     }
@@ -497,9 +462,15 @@ EOF
       script {
         sh '''
         echo "✗ Pipeline en échec"
-        echo "Logs des derniers pods en dev:"
-        kubectl get pods -n dev --kubeconfig=.kube/config 2>/dev/null || true
-        kubectl logs --tail=20 -n dev deployment/app --kubeconfig=.kube/config 2>/dev/null || true
+        echo "Logs de débogage:"
+        echo "1. Taints des nœuds:"
+        kubectl describe nodes --kubeconfig=.kube/config 2>/dev/null | grep -i taint || true
+        echo ""
+        echo "2. Événements récents:"
+        for ns in dev staging prod; do
+          echo "--- $ns ---"
+          kubectl get events -n $ns --sort-by='.lastTimestamp' --kubeconfig=.kube/config 2>/dev/null | tail -5 || true
+        done
         '''
       }
     }
