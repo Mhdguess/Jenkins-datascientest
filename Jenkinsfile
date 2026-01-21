@@ -129,11 +129,25 @@ pipeline {
           # Modifier le tag
           sed -i 's/^  tag:.*/  tag: "'"${DOCKER_TAG}"'"/' values-dev.yml
           
-          # CORRECTION: Utiliser perl au lieu de sed pour éviter les problèmes d'échappement
-          perl -i -pe 's/^tolerations: \[\]/tolerations:\n- key: "node.kubernetes.io\/not-ready"\n  operator: "Exists"\n  effect: "NoSchedule"\n- key: "node.kubernetes.io\/unreachable"\n  operator: "Exists"\n  effect: "NoSchedule"\n- key: "node-role.kubernetes.io\/control-plane"\n  operator: "Exists"\n  effect: "NoSchedule"/' values-dev.yml
+          # CORRECTION: Supprimer la ligne 'tolerations: []' si elle existe
+          sed -i '/^tolerations: \\[\\]/d' values-dev.yml
+          
+          # AJOUT: Ajouter des tolerations pour résoudre le problème de scheduling
+          echo "" >> values-dev.yml
+          echo "# AJOUT: Tolerations pour résoudre le problème de taints" >> values-dev.yml
+          echo "tolerations:" >> values-dev.yml
+          echo "- key: \"node.kubernetes.io/not-ready\"" >> values-dev.yml
+          echo "  operator: \"Exists\"" >> values-dev.yml
+          echo "  effect: \"NoSchedule\"" >> values-dev.yml
+          echo "- key: \"node.kubernetes.io/unreachable\"" >> values-dev.yml
+          echo "  operator: \"Exists\"" >> values-dev.yml
+          echo "  effect: \"NoSchedule\"" >> values-dev.yml
+          echo "- key: \"node-role.kubernetes.io/control-plane\"" >> values-dev.yml
+          echo "  operator: \"Exists\"" >> values-dev.yml
+          echo "  effect: \"NoSchedule\"" >> values-dev.yml
           
           echo "Valeurs utilisées pour le déploiement:"
-          cat values-dev.yml | grep -A10 -B2 -E "(tag:|tolerations:)"
+          cat values-dev.yml | grep -A2 -B2 "tag:"
           
           # 7. Déployer avec Helm - SANS TIMEOUT ET SANS --wait
           echo "Exécution de Helm upgrade/install..."
@@ -190,8 +204,22 @@ pipeline {
           # Changer la pull policy pour Always pour s'assurer d'avoir la dernière image
           sed -i 's/^  pullPolicy:.*/  pullPolicy: Always/' values-staging.yml
           
-          # CORRECTION: Utiliser perl au lieu de sed pour éviter les problèmes d'échappement
-          perl -i -pe 's/^tolerations: \[\]/tolerations:\n- key: "node.kubernetes.io\/not-ready"\n  operator: "Exists"\n  effect: "NoSchedule"\n- key: "node.kubernetes.io\/unreachable"\n  operator: "Exists"\n  effect: "NoSchedule"\n- key: "node-role.kubernetes.io\/control-plane"\n  operator: "Exists"\n  effect: "NoSchedule"/' values-staging.yml
+          # CORRECTION: Supprimer la ligne 'tolerations: []' si elle existe
+          sed -i '/^tolerations: \\[\\]/d' values-staging.yml
+          
+          # AJOUT: Ajouter des tolerations pour résoudre le problème de scheduling
+          echo "" >> values-staging.yml
+          echo "# AJOUT: Tolerations pour résoudre le problème de taints" >> values-staging.yml
+          echo "tolerations:" >> values-staging.yml
+          echo "- key: \"node.kubernetes.io/not-ready\"" >> values-staging.yml
+          echo "  operator: \"Exists\"" >> values-staging.yml
+          echo "  effect: \"NoSchedule\"" >> values-staging.yml
+          echo "- key: \"node.kubernetes.io/unreachable\"" >> values-staging.yml
+          echo "  operator: \"Exists\"" >> values-staging.yml
+          echo "  effect: \"NoSchedule\"" >> values-staging.yml
+          echo "- key: \"node-role.kubernetes.io/control-plane\"" >> values-staging.yml
+          echo "  operator: \"Exists\"" >> values-staging.yml
+          echo "  effect: \"NoSchedule\"" >> values-staging.yml
           
           echo "Vérification des modifications:"
           grep -n -E "(tag:|replicaCount:|pullPolicy:|tolerations:)" values-staging.yml
@@ -253,7 +281,7 @@ resources:
   requests:
     cpu: 200m
     memory: 256Mi
-# Tolerations pour résoudre le problème de taints
+# AJOUT: Tolerations pour résoudre le problème de taints
 tolerations:
 - key: "node.kubernetes.io/not-ready"
   operator: "Exists"
