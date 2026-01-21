@@ -129,11 +129,8 @@ pipeline {
           # Modifier le tag
           sed -i 's/^  tag:.*/  tag: "'"${DOCKER_TAG}"'"/' values-dev.yml
           
-          # CORRECTION: Supprimer la ligne "tolerations: []" vide
-          sed -i '/^tolerations: \[\]/d' values-dev.yml
-          
-          # CORRECTION: Ajouter les tolerations après la ligne "affinity: {}"
-          sed -i '/^affinity: {}/a\\ntolerations:\\n- key: \"node.kubernetes.io\\/not-ready\"\\n  operator: \"Exists\"\\n  effect: \"NoSchedule\"\\n- key: \"node.kubernetes.io\\/unreachable\"\\n  operator: \"Exists\"\\n  effect: \"NoSchedule\"\\n- key: \"node-role.kubernetes.io\\/control-plane\"\\n  operator: \"Exists\"\\n  effect: \"NoSchedule\"' values-dev.yml
+          # CORRECTION: Remplacer "tolerations: []" par les vraies tolerations
+          sed -i 's/^tolerations: \[\]/tolerations:\\n- key: "node.kubernetes.io\\/not-ready"\\n  operator: "Exists"\\n  effect: "NoSchedule"\\n- key: "node.kubernetes.io\\/unreachable"\\n  operator: "Exists"\\n  effect: "NoSchedule"\\n- key: "node-role.kubernetes.io\\/control-plane"\\n  operator: "Exists"\\n  effect: "NoSchedule"/' values-dev.yml
           
           echo "Valeurs utilisées pour le déploiement:"
           cat values-dev.yml | grep -A10 -B2 -E "(tag:|tolerations:)"
@@ -193,11 +190,8 @@ pipeline {
           # Changer la pull policy pour Always pour s'assurer d'avoir la dernière image
           sed -i 's/^  pullPolicy:.*/  pullPolicy: Always/' values-staging.yml
           
-          # CORRECTION: Supprimer la ligne "tolerations: []" vide
-          sed -i '/^tolerations: \[\]/d' values-staging.yml
-          
-          # CORRECTION: Ajouter les tolerations après la ligne "affinity: {}"
-          sed -i '/^affinity: {}/a\\ntolerations:\\n- key: \"node.kubernetes.io\\/not-ready\"\\n  operator: \"Exists\"\\n  effect: \"NoSchedule\"\\n- key: \"node.kubernetes.io\\/unreachable\"\\n  operator: \"Exists\"\\n  effect: \"NoSchedule\"\\n- key: \"node-role.kubernetes.io\\/control-plane\"\\n  operator: \"Exists\"\\n  effect: \"NoSchedule\"' values-staging.yml
+          # CORRECTION: Remplacer "tolerations: []" par les vraies tolerations
+          sed -i 's/^tolerations: \[\]/tolerations:\\n- key: "node.kubernetes.io\\/not-ready"\\n  operator: "Exists"\\n  effect: "NoSchedule"\\n- key: "node.kubernetes.io\\/unreachable"\\n  operator: "Exists"\\n  effect: "NoSchedule"\\n- key: "node-role.kubernetes.io\\/control-plane"\\n  operator: "Exists"\\n  effect: "NoSchedule"/' values-staging.yml
           
           echo "Vérification des modifications:"
           grep -n -E "(tag:|replicaCount:|pullPolicy:|tolerations:)" values-staging.yml
@@ -247,7 +241,6 @@ pipeline {
           kubectl create namespace prod --dry-run=client -o yaml | kubectl apply -f - --kubeconfig=$KUBECONFIG || true
           
           # Créer un fichier d'overrides séparé pour éviter les problèmes YAML
-          # CORRECTION: Supprimer la ligne vide "tolerations: []" qui est déjà dans le fichier
           cat > prod-overrides.yml << EOF
 image:
   tag: ${DOCKER_TAG}
@@ -260,8 +253,7 @@ resources:
   requests:
     cpu: 200m
     memory: 256Mi
-# CORRECTION: Ajouter les tolerations pour résoudre le problème de taints
-# La ligne "tolerations: []" dans values.yaml sera écrasée par ceci
+# Tolerations pour résoudre le problème de taints
 tolerations:
 - key: "node.kubernetes.io/not-ready"
   operator: "Exists"
