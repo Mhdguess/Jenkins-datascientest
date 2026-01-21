@@ -124,32 +124,108 @@ pipeline {
           # 5. Créer le namespace si nécessaire
           kubectl create namespace dev --dry-run=client -o yaml | kubectl apply -f - --kubeconfig=.kube/config || true
           
-          # 6. Préparer le fichier values pour Helm
-          cp fastapi/values.yaml values-dev.yml
-          # Modifier le tag
-          sed -i 's/^  tag:.*/  tag: "'"${DOCKER_TAG}"'"/' values-dev.yml
-          
-          # CORRECTION: Supprimer la ligne 'tolerations: []' si elle existe
-          sed -i '/^tolerations: \\[\\]/d' values-dev.yml
-          
-          # AJOUT: Ajouter des tolerations pour résoudre le problème de scheduling
-          echo "" >> values-dev.yml
-          echo "# AJOUT: Tolerations pour résoudre le problème de taints" >> values-dev.yml
-          echo "tolerations:" >> values-dev.yml
-          echo "- key: \"node.kubernetes.io/not-ready\"" >> values-dev.yml
-          echo "  operator: \"Exists\"" >> values-dev.yml
-          echo "  effect: \"NoSchedule\"" >> values-dev.yml
-          echo "- key: \"node.kubernetes.io/unreachable\"" >> values-dev.yml
-          echo "  operator: \"Exists\"" >> values-dev.yml
-          echo "  effect: \"NoSchedule\"" >> values-dev.yml
-          echo "- key: \"node-role.kubernetes.io/control-plane\"" >> values-dev.yml
-          echo "  operator: \"Exists\"" >> values-dev.yml
-          echo "  effect: \"NoSchedule\"" >> values-dev.yml
+          # 6. Préparer le fichier values pour Helm - SOLUTION COMPLÈTE
+          # Créer un nouveau fichier values au lieu de modifier l'existant
+          cat > values-dev.yml << EOF
+replicaCount: 1
+
+image:
+  repository: guessod/datascientestapi
+  pullPolicy: IfNotPresent
+  # Overrides the image tag whose default is the chart appVersion.
+  tag: "${DOCKER_TAG}"
+
+# This is for the secrets for pulling an image from a private repository more information can be found here: https://kubernetes.io/docs/tasks/configure-pod-container/pull-image-private-registry/
+imagePullSecrets: []
+nameOverride: ""
+fullnameOverride: ""
+
+serviceAccount:
+  # Specifies whether a service account should be created
+  create: true
+  # Annotations to add to the service account
+  annotations: {}
+  # The name of the service account to use.
+  # If not set and create is true, a name is generated using the fullname template
+  name: ""
+
+podAnnotations: {}
+podLabels: {}
+
+podSecurityContext: {}
+  # fsGroup: 2000
+
+securityContext: {}
+  # capabilities:
+  #   drop:
+  #   - ALL
+  # readOnlyRootFilesystem: true
+  # runAsNonRoot: true
+  # runAsUser: 1000
+
+service:
+  type: NodePort
+  port: 80
+
+ingress:
+  enabled: false
+  className: ""
+  annotations: {}
+    # kubernetes.io/ingress.class: nginx
+    # kubernetes.io/tls-acme: "true"
+  hosts:
+    - host: chart-example.local
+      paths:
+        - path: /
+          pathType: ImplementationSpecific
+  tls: []
+  #  - secretName: chart-example-tls
+  #    hosts:
+  #      - chart-example.local
+
+resources: {}
+  # We usually recommend not to specify default resources and to leave this as a conscious
+  # choice for the user. This also increases chances charts run on environments with little
+  # resources, such as Minikube. If you do want to specify resources, uncomment the following
+  # lines, adjust them as necessary, and remove the curly braces after 'resources:'.
+  # limits:
+  #   cpu: 100m
+  #   memory: 128Mi
+  # requests:
+  #   cpu: 100m
+  #   memory: 128Mi
+
+autoscaling:
+  enabled: false
+  minReplicas: 1
+  maxReplicas: 100
+  targetCPUUtilizationPercentage: 80
+  # targetMemoryUtilizationPercentage: 80
+
+nodeSelector: {}
+
+# CORRECTION: Tolerations pour résoudre le problème de taints
+tolerations:
+- key: "node.kubernetes.io/not-ready"
+  operator: "Exists"
+  effect: "NoSchedule"
+- key: "node.kubernetes.io/unreachable"
+  operator: "Exists"
+  effect: "NoSchedule"
+- key: "node-role.kubernetes.io/control-plane"
+  operator: "Exists"
+  effect: "NoSchedule"
+- key: "node-role.kubernetes.io/master"
+  operator: "Exists"
+  effect: "NoSchedule"
+
+affinity: {}
+EOF
           
           echo "Valeurs utilisées pour le déploiement:"
           cat values-dev.yml | grep -A2 -B2 "tag:"
           
-          # 7. Déployer avec Helm - SANS TIMEOUT ET SANS --wait
+          # 7. Déployer avec Helm
           echo "Exécution de Helm upgrade/install..."
           helm upgrade --install app fastapi \
             --values=values-dev.yml \
@@ -193,38 +269,107 @@ pipeline {
           # Créer namespace staging
           kubectl create namespace staging --dry-run=client -o yaml | kubectl apply -f - --kubeconfig=$KUBECONFIG || true
           
-          # Préparer values
-          cp fastapi/values.yaml values-staging.yml
-          # Modifier le tag
-          sed -i 's/^  tag:.*/  tag: "'"${DOCKER_TAG}"'"/' values-staging.yml
-          
-          # Modifier replicaCount
-          sed -i 's/^replicaCount:.*/replicaCount: 2/' values-staging.yml
-          
-          # Changer la pull policy pour Always pour s'assurer d'avoir la dernière image
-          sed -i 's/^  pullPolicy:.*/  pullPolicy: Always/' values-staging.yml
-          
-          # CORRECTION: Supprimer la ligne 'tolerations: []' si elle existe
-          sed -i '/^tolerations: \\[\\]/d' values-staging.yml
-          
-          # AJOUT: Ajouter des tolerations pour résoudre le problème de scheduling
-          echo "" >> values-staging.yml
-          echo "# AJOUT: Tolerations pour résoudre le problème de taints" >> values-staging.yml
-          echo "tolerations:" >> values-staging.yml
-          echo "- key: \"node.kubernetes.io/not-ready\"" >> values-staging.yml
-          echo "  operator: \"Exists\"" >> values-staging.yml
-          echo "  effect: \"NoSchedule\"" >> values-staging.yml
-          echo "- key: \"node.kubernetes.io/unreachable\"" >> values-staging.yml
-          echo "  operator: \"Exists\"" >> values-staging.yml
-          echo "  effect: \"NoSchedule\"" >> values-staging.yml
-          echo "- key: \"node-role.kubernetes.io/control-plane\"" >> values-staging.yml
-          echo "  operator: \"Exists\"" >> values-staging.yml
-          echo "  effect: \"NoSchedule\"" >> values-staging.yml
+          # Préparer values - SOLUTION COMPLÈTE
+          cat > values-staging.yml << EOF
+replicaCount: 2
+
+image:
+  repository: guessod/datascientestapi
+  pullPolicy: Always
+  # Overrides the image tag whose default is the chart appVersion.
+  tag: "${DOCKER_TAG}"
+
+# This is for the secrets for pulling an image from a private repository more information can be found here: https://kubernetes.io/docs/tasks/configure-pod-container/pull-image-private-registry/
+imagePullSecrets: []
+nameOverride: ""
+fullnameOverride: ""
+
+serviceAccount:
+  # Specifies whether a service account should be created
+  create: true
+  # Annotations to add to the service account
+  annotations: {}
+  # The name of the service account to use.
+  # If not set and create is true, a name is generated using the fullname template
+  name: ""
+
+podAnnotations: {}
+podLabels: {}
+
+podSecurityContext: {}
+  # fsGroup: 2000
+
+securityContext: {}
+  # capabilities:
+  #   drop:
+  #   - ALL
+  # readOnlyRootFilesystem: true
+  # runAsNonRoot: true
+  # runAsUser: 1000
+
+service:
+  type: NodePort
+  port: 80
+
+ingress:
+  enabled: false
+  className: ""
+  annotations: {}
+    # kubernetes.io/ingress.class: nginx
+    # kubernetes.io/tls-acme: "true"
+  hosts:
+    - host: chart-example.local
+      paths:
+        - path: /
+          pathType: ImplementationSpecific
+  tls: []
+  #  - secretName: chart-example-tls
+  #    hosts:
+  #      - chart-example.local
+
+resources: {}
+  # We usually recommend not to specify default resources and to leave this as a conscious
+  # choice for the user. This also increases chances charts run on environments with little
+  # resources, such as Minikube. If you do want to specify resources, uncomment the following
+  # lines, adjust them as necessary, and remove the curly braces after 'resources:'.
+  # limits:
+  #   cpu: 100m
+  #   memory: 128Mi
+  # requests:
+  #   cpu: 100m
+  #   memory: 128Mi
+
+autoscaling:
+  enabled: false
+  minReplicas: 1
+  maxReplicas: 100
+  targetCPUUtilizationPercentage: 80
+  # targetMemoryUtilizationPercentage: 80
+
+nodeSelector: {}
+
+# CORRECTION: Tolerations pour résoudre le problème de taints
+tolerations:
+- key: "node.kubernetes.io/not-ready"
+  operator: "Exists"
+  effect: "NoSchedule"
+- key: "node.kubernetes.io/unreachable"
+  operator: "Exists"
+  effect: "NoSchedule"
+- key: "node-role.kubernetes.io/control-plane"
+  operator: "Exists"
+  effect: "NoSchedule"
+- key: "node-role.kubernetes.io/master"
+  operator: "Exists"
+  effect: "NoSchedule"
+
+affinity: {}
+EOF
           
           echo "Vérification des modifications:"
           grep -n -E "(tag:|replicaCount:|pullPolicy:|tolerations:)" values-staging.yml
           
-          # Déployer avec Helm - SANS TIMEOUT ET SANS --wait
+          # Déployer avec Helm
           echo "Déploiement avec Helm..."
           helm upgrade --install app fastapi \
             --values=values-staging.yml \
