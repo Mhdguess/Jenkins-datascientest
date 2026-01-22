@@ -606,16 +606,7 @@ EOF
       }
     }
   }
-  
-  post {
-    failure {
-        echo "This will run if the job failed"
-        mail to: "mohamedguessod@gmail.com",
-             subject: "${env.JOB_NAME} - Build # ${env.BUILD_ID} has failed",
-             body: "For more info on the pipeline failure, check out the console output at ${env.BUILD_URL}"
-      }
-  }
-  
+    
   post {
     always {
       script {
@@ -711,6 +702,10 @@ EOF
         echo "3. Relancer le pipeline après nettoyage"
         '''
       }
+      echo "This will run if the job failed"
+      mail to: "mohamedguessod@gmail.com",
+           subject: "${env.JOB_NAME} - Build # ${env.BUILD_ID} has failed",
+           body: "For more info on the pipeline failure, check out the console output at ${env.BUILD_URL}"
     }
   }
 }
